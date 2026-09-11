@@ -1,8 +1,3 @@
-제공해주신 코드를 바탕으로, 출석 솔 에르다 조각 데이터베이스 경로와 연동 로직이 꼬이지 않도록 절대 경로(os.path) 설정을 완벽하게 적용하고, 기존 기능들과 충돌 없이 깔끔하게 통합한 전체 코드를 작성했습니다.
-
-이 코드를 복사해서 그대로 봇 프로젝트의 main.py에 붙여넣으시면 됩니다.
-
-Python
 import asyncio
 from datetime import datetime, timedelta, timezone
 import os
