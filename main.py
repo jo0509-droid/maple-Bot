@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 import os
 import random
 import sqlite3
+import asyncio
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -38,10 +39,11 @@ def init_attendance_db():
         )
     """
     )
-    # ON CONFLICT 오류 해결을 위한 PRIMARY KEY 지정
+    # 기존 설정 테이블의 제약 조건 충돌 문제를 해결하기 위해 드롭 후 재생성 (출석 데이터는 유지됨)
+    cursor.execute("DROP TABLE IF EXISTS settings;")
     cursor.execute(
         """
-        CREATE TABLE IF NOT EXISTS settings (
+        CREATE TABLE settings (
             guild_id INTEGER PRIMARY KEY,
             channel_id INTEGER
         )
@@ -422,7 +424,7 @@ async def check_voice_time():
                     continue
                 current_time = user_voice_seconds.get(member.id, 0) + 60
                 user_voice_seconds[member.id] = current_time
-                if current_time >= 600:  # 10분(600초)으로 단축 적용
+                if current_time >= 600:  # 10분(600초) 단축
                     await process_attendance(member, today_str)
     conn.commit()
     conn.close()
