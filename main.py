@@ -1,4 +1,3 @@
-제공해주신 main_5.py 파일에서 발생한 ON CONFLICT 오류(테이블 생성 제약 조건 문제)와 출석 시간 요구 사항(1시간 ➔ 10분)을 모두 반영하여 깔끔하게 정리한 전체 코드입니다.  settings 테이블 생성 시 guild_id INTEGER PRIMARY KEY가 명확히 지정되도록 수정하였으며, 음성 체크 루프 내 출석 인정 시간 기준을 600초(10분)로 맞추어 정리했습니다.  Pythonimport asyncio
 from datetime import datetime, timedelta, timezone
 import os
 import random
