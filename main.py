@@ -1,4 +1,3 @@
-Python
 import asyncio
 from datetime import datetime, timedelta, timezone
 import os
