@@ -5,6 +5,7 @@ import datetime
 from datetime import datetime, timedelta, timezone
 import asyncio
 import sqlite3
+import os
 
 KST = timezone(timedelta(hours=9))
 now = datetime.now(KST)
@@ -13,12 +14,13 @@ user_voice_seconds = {}
 intents =  discord.Intents.default()
 intents.voice_states = True
 intents.message_content = True
+intents.members = True
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-EXCLUDED_CHANNEL_IDS = [1498090796824526908]
-CATEGORY_ID = [1534250108475150438]
+EXCLUDED_CHANNEL_IDS = [1498085152281067791]
+CATEGORY_ID = [1530948235563372707]
 
 def init_db():
     conn = sqlite3.connect("attendance.db")
