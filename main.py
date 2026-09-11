@@ -26,6 +26,7 @@ CATEGORY_ID = [1530948235563372707]
 def init_attendance_db():
     conn = sqlite3.connect("integrated.db") 
     cursor = conn.cursor()
+    # 기존 데이터 호환을 위해 users 테이블 및 attendance_users 테이블 모두 안전하게 생성
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS attendance_users (
@@ -335,7 +336,8 @@ class buybutton(discord.ui.View):
 @bot.event
 async def on_ready():
     init_attendance_db()
-    check_voice_time.start()
+    if not check_voice_time.is_running():
+        check_voice_time.start()
     print(f'로그인 성공: {bot.user.name}')
     try:
         MY_GUILD = discord.Object(id=1498077956839313559)
@@ -542,6 +544,7 @@ async def check_attendance(interaction: discord.Interaction):
             "INSERT INTO attendance_users (user_id, last_check, count) VALUES (?, ?, ?)",
             (user_id, today_str, 0),
         )
+        conn.commit()
         await interaction.response.send_message(
             f"🐣 아직 출석을 하지 않았습니다, {interaction.user.mention}님\n"
             f"🗓️ 오늘 날짜: `{today_str}`\n"
@@ -554,7 +557,6 @@ async def check_attendance(interaction: discord.Interaction):
             f"🗓️ 오늘 날짜: `{today_str}`\n"
             f"📊 누적 출석 일수: **{count}일**"
         )
-    conn.commit()
     conn.close()
 
 USER_COOLDOWNS = {}
