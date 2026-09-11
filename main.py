@@ -24,11 +24,11 @@ EXCLUDED_CHANNEL_IDS = [1498085152281067791]
 CATEGORY_ID = [1530948235563372707]
 
 def init_attendance_db():
-    conn = sqlite3.connect("attendance.db")
+    conn = sqlite3.connect("integrated.db") 
     cursor = conn.cursor()
     cursor.execute(
         """
-        CREATE TABLE IF NOT EXISTS users (
+        CREATE TABLE IF NOT EXISTS attendance_users (
             user_id INTEGER PRIMARY KEY,
             last_check TEXT,
             count INTEGER DEFAULT 0,
@@ -353,11 +353,11 @@ async def on_voice_state_update(member, before, after):
         return
     if before.channel is None and after.channel is not None: 
         now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-        conn = sqlite3.connect("attendance.db")
+        conn = sqlite3.connect("integrated.db")
         cursor = conn.cursor()
         cursor.execute(
             """ 
-            INSERT INTO users (user_id, last_voice_at) VALUES (?, ?)
+            INSERT INTO attendance_users (user_id, last_voice_at) VALUES (?, ?)
             ON CONFLICT(user_id) DO UPDATE SET last_voice_at = excluded.last_voice_at
             """,
             (member.id, now_str)
@@ -374,10 +374,10 @@ async def check_voice_time():
     today_str = now.strftime("%Y-%m-%d")
     if now.hour == 0 and now.minute == 0:
         user_voice_seconds.clear()
-        conn = sqlite3.connect("attendance.db")
+        conn = sqlite3.connect("integrated.db")
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT user_id, last_voice_at, count FROM users WHERE count > 0"
+            "SELECT user_id, last_voice_at, count FROM attendance_users WHERE count > 0"
         )
         rows = cursor.fetchall()
         for user_id, last_voice_at_str, count in rows:
@@ -387,18 +387,18 @@ async def check_voice_time():
                 if hours_diff >= 72:
                     if count % 30 != 0:
                         cursor.execute(
-                            "UPDATE users SET count = 0 WHERE user_id = ?", (user_id,)
+                            "UPDATE attendance_users SET count = 0 WHERE user_id = ?", (user_id,)
                         )
                     elif count % 30 == 0:
                         new_count = int((count // 30) * 30)
                         cursor.execute(
-                            "UPDATE users SET count = ? WHERE user_id = ?", (new_count, user_id)
+                            "UPDATE attendance_users SET count = ? WHERE user_id = ?", (new_count, user_id)
                         )
         conn.commit()
         conn.close()
         return
 
-    conn = sqlite3.connect("attendance.db")
+    conn = sqlite3.connect("integrated.db")
     cursor = conn.cursor()
     for guild in bot.guilds:
         for vc in guild.voice_channels:
@@ -406,7 +406,7 @@ async def check_voice_time():
                 if member.bot:
                     continue
                 cursor.execute(
-                    "SELECT last_check, count FROM users WHERE user_id = ?", (member.id,)
+                    "SELECT last_check, count FROM attendance_users WHERE user_id = ?", (member.id,)
                 )
                 row = cursor.fetchone()
                 if row and row[0] == today_str:
@@ -419,16 +419,16 @@ async def check_voice_time():
     conn.close()
 
 async def process_attendance(member, today_str):
-    conn = sqlite3.connect("attendance.db")
+    conn = sqlite3.connect("integrated.db")
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT last_check, count FROM users WHERE user_id = ?", (member.id,)
+        "SELECT last_check, count FROM attendance_users WHERE user_id = ?", (member.id,)
     )
     row = cursor.fetchone()
 
     if row is None:
         cursor.execute(
-            "INSERT INTO users (user_id, last_check, count) VALUES (?, ?, ?)",
+            "INSERT INTO attendance_users (user_id, last_check, count) VALUES (?, ?, ?)",
             (member.id, today_str, 1),
         )
         count = 1
@@ -437,7 +437,7 @@ async def process_attendance(member, today_str):
         if last_check != today_str:
             count += 1
             cursor.execute(
-                "UPDATE users SET last_check = ?, count = ? WHERE user_id = ?",
+                "UPDATE attendance_users SET last_check = ?, count = ? WHERE user_id = ?",
                 (today_str, count, member.id),
             )
     conn.commit()
@@ -501,7 +501,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @app_commands.checks.has_permissions(administrator=True)
 async def set_attendance_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     guild_id = interaction.guild.id
-    conn = sqlite3.connect("attendance.db")
+    conn = sqlite3.connect("integrated.db")
     cursor = conn.cursor()
     cursor.execute(
         """INSERT INTO settings (guild_id, channel_id) VALUES (?, ?) ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id""",
@@ -530,16 +530,16 @@ async def check_attendance(interaction: discord.Interaction):
     user_id = interaction.user.id
     today_str = datetime.now(KST).strftime("%Y-%m-%d")
 
-    conn = sqlite3.connect("attendance.db")
+    conn = sqlite3.connect("integrated.db")
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT last_check, count FROM users WHERE user_id = ?", (user_id,)
+        "SELECT last_check, count FROM attendance_users WHERE user_id = ?", (user_id,)
     )
     row = cursor.fetchone()
 
     if row is None:
         cursor.execute(
-            "INSERT INTO users (user_id, last_check, count) VALUES (?, ?, ?)",
+            "INSERT INTO attendance_users (user_id, last_check, count) VALUES (?, ?, ?)",
             (user_id, today_str, 0),
         )
         await interaction.response.send_message(
