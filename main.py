@@ -48,7 +48,6 @@ def init_attendance_db():
         )
     """
     )
-    # 기존 테이블에 sol_erda_pieces 컬럼이 없다면 안전하게 추가 (7일 보상용)
     try:
         cursor.execute("ALTER TABLE attendance_users ADD COLUMN sol_erda_pieces INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
@@ -256,7 +255,7 @@ def get_max_exp(level):
     else: return 999999999999
 
 # ------------------------------------------
-# UI 클래스들 (판매글 및 거래 기능)
+# UI 클래스들
 # ------------------------------------------
 class SaleModal(discord.ui.Modal, title="판매글 등록"):
     sale_amount = discord.ui.TextInput(label="판매 수량을 입력해주세요", placeholder="10억 메소는 10", required=True)
@@ -322,7 +321,7 @@ class buybutton(discord.ui.View):
             return
         category = interaction.guild.get_channel(CATEGORY_ID[0])
         await interaction.response.defer(ephemeral=True)
-        original_message = (interaction.message)
+        original_message = interaction.message
         trading_message = discord.Embed(title="거래중...", description="현재 거래가 진행 중인 게시글 입니다.")
         await original_message.edit(embed=trading_message, view=Saleview(seller=self.seller))
         overwrites = {
@@ -424,7 +423,7 @@ async def check_voice_time():
                     continue
                 current_time = user_voice_seconds.get(member.id, 0) + 60
                 user_voice_seconds[member.id] = current_time
-                if current_time >= 3600:
+                if current_time >= 600:
                     await process_attendance(member, today_str)
     conn.commit()
     conn.close()
@@ -502,22 +501,23 @@ async def process_attendance(member, today_str):
             f"✅ {member.mention}님 오늘 출석이 완료되었습니다!\n" + base_desc
         )
 
+# ------------------------------------------
+# 통합 에러 핸들러 (중복 에러 제거 및 정리)
+# ------------------------------------------
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CommandOnCooldown):
         seconds = int(error.retry_after)
         msg = f"⏳ 미끼를 준비 중입니다... **{seconds}초 후**에 다시 낚시할 수 있습니다!"
-        if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
     elif isinstance(error, app_commands.MissingPermissions):
-        if interaction.response.is_done():
-            await interaction.followup.send("❌ 관리자 권한이 필요합니다.", ephemeral=True)
-        else:
-            await interaction.response.send_message("❌ 관리자 권한이 필요합니다.", ephemeral=True)
+        msg = "❌ 이 명령어를 실행할 관리자 권한이 부족합니다."
     else:
-        raise error
+        msg = f"❌ 명령어 실행 중 오류가 발생했습니다: {error}"
+
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
 
 # ------------------------------------------
 # 명령어 모음 (출석, 판매, 낚시 등)
@@ -529,19 +529,13 @@ async def set_attendance_channel(interaction: discord.Interaction, channel: disc
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
-        """INSERT INTO settings (guild_id, channel_id) VALUES (?, ?) ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id""",
+        """INSERT INTO settings (guild_id, channel_id) VALUES (?, ?) 
+           ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id""",
         (guild_id, channel.id),
     )
     conn.commit()
     conn.close()
-    await interaction.response.send_message(f"출석 채널이 {channel.mention}로 설정되었습니다.")
-
-@set_attendance_channel.error
-async def set_attendance_channel_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("관리자 권한이 필요합니다.", ephemeral=True)
-    else:
-        await interaction.response.send_message("오류가 발생했습니다.", ephemeral=True)
+    await interaction.response.send_message(f"✅ 출석 채널이 {channel.mention}로 성공적으로 설정되었습니다.", ephemeral=True)
 
 @bot.tree.command(name="판매글등록", description="판매글을 등록합니다.")
 @app_commands.checks.has_permissions(administrator=True)
