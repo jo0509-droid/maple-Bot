@@ -1,3 +1,8 @@
+제공해주신 코드를 바탕으로, 출석 솔 에르다 조각 데이터베이스 경로와 연동 로직이 꼬이지 않도록 절대 경로(os.path) 설정을 완벽하게 적용하고, 기존 기능들과 충돌 없이 깔끔하게 통합한 전체 코드를 작성했습니다.
+
+이 코드를 복사해서 그대로 봇 프로젝트의 main.py에 붙여넣으시면 됩니다.
+
+Python
 import asyncio
 from datetime import datetime, timedelta, timezone
 import os
@@ -15,7 +20,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 # ----------------------------------------
-# 타임존 및 기본 설정 (출석/음성용)
+# 타임존 및 절대 경로 DB 설정 (출석/음성용)
 # ----------------------------------------
 KST = timezone(timedelta(hours=9))
 user_voice_seconds = {}
@@ -23,10 +28,13 @@ user_voice_seconds = {}
 EXCLUDED_CHANNEL_IDS = [1498085152281067791]
 CATEGORY_ID = [1530948235563372707]
 
+# 봇 실행 위치 기준으로 integrated.db 절대 경로 고정 (경로 꼬임 방지)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "integrated.db")
+
 def init_attendance_db():
-    conn = sqlite3.connect("integrated.db") 
+    conn = sqlite3.connect(DB_PATH) 
     cursor = conn.cursor()
-    # 기존 데이터 호환을 위해 users 테이블 및 attendance_users 테이블 모두 안전하게 생성
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS attendance_users (
@@ -361,7 +369,7 @@ async def on_voice_state_update(member, before, after):
         return
     if before.channel is None and after.channel is not None: 
         now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-        conn = sqlite3.connect("integrated.db")
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
             """ 
@@ -382,7 +390,7 @@ async def check_voice_time():
     today_str = now.strftime("%Y-%m-%d")
     if now.hour == 0 and now.minute == 0:
         user_voice_seconds.clear()
-        conn = sqlite3.connect("integrated.db")
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
             "SELECT user_id, last_voice_at, count FROM attendance_users WHERE count > 0"
@@ -406,7 +414,7 @@ async def check_voice_time():
         conn.close()
         return
 
-    conn = sqlite3.connect("integrated.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     for guild in bot.guilds:
         for vc in guild.voice_channels:
@@ -427,7 +435,7 @@ async def check_voice_time():
     conn.close()
 
 async def process_attendance(member, today_str):
-    conn = sqlite3.connect("integrated.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT last_check, count, COALESCE(sol_erda_pieces, 0) FROM attendance_users WHERE user_id = ?", (member.id,)
@@ -468,7 +476,6 @@ async def process_attendance(member, today_str):
     if not channel:
         return
 
-    # 다음 보상까지 남은 일수 계산 (7일 주기)
     remainder = count % 7
     days_left = 7 - remainder if remainder != 0 else 0
     if days_left == 0:
@@ -524,7 +531,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @app_commands.checks.has_permissions(administrator=True)
 async def set_attendance_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     guild_id = interaction.guild.id
-    conn = sqlite3.connect("integrated.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         """INSERT INTO settings (guild_id, channel_id) VALUES (?, ?) ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id""",
@@ -553,7 +560,7 @@ async def check_attendance(interaction: discord.Interaction):
     user_id = interaction.user.id
     today_str = datetime.now(KST).strftime("%Y-%m-%d")
 
-    conn = sqlite3.connect("integrated.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT last_check, count, COALESCE(sol_erda_pieces, 0) FROM attendance_users WHERE user_id = ?", (user_id,)
@@ -586,7 +593,6 @@ async def check_attendance(interaction: discord.Interaction):
         f"⏳ 다음 보상까지: 앞으로 **{days_left}일** 남았습니다."
     )
 
-# 관리자용 출석 관련 설정 및 조각 수정 명령어
 @bot.tree.command(name="출석", description="출석 및 솔 에르다 조각 관리 명령어입니다.")
 @app_commands.describe(
     action="수행할 작업",
@@ -599,7 +605,7 @@ async def check_attendance(interaction: discord.Interaction):
 @app_commands.checks.has_permissions(administrator=True)
 async def attendance_admin(interaction: discord.Interaction, action: str, user: discord.Member, amount: int):
     if action == "조각수정":
-        conn = sqlite3.connect("integrated.db")
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
         cursor.execute("SELECT user_id FROM attendance_users WHERE user_id = ?", (user.id,))
