@@ -1,3 +1,4 @@
+Python
 import asyncio
 from datetime import datetime, timedelta, timezone
 import os
@@ -45,6 +46,12 @@ def init_attendance_db():
         )
     """
     )
+    # 기존 테이블에 sol_erda_pieces 컬럼이 없다면 안전하게 추가 (7일 보상용)
+    try:
+        cursor.execute("ALTER TABLE attendance_users ADD COLUMN sol_erda_pieces INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -424,23 +431,30 @@ async def process_attendance(member, today_str):
     conn = sqlite3.connect("integrated.db")
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT last_check, count FROM attendance_users WHERE user_id = ?", (member.id,)
+        "SELECT last_check, count, COALESCE(sol_erda_pieces, 0) FROM attendance_users WHERE user_id = ?", (member.id,)
     )
     row = cursor.fetchone()
 
+    reward_msg = ""
     if row is None:
-        cursor.execute(
-            "INSERT INTO attendance_users (user_id, last_check, count) VALUES (?, ?, ?)",
-            (member.id, today_str, 1),
-        )
         count = 1
+        pieces = 5 if count % 7 == 0 else 0
+        if pieces > 0:
+            reward_msg = "\n🎉 **누적 출석 7일 달성!** 솔 에르다 조각 **5개**가 지급되었습니다!"
+        cursor.execute(
+            "INSERT INTO attendance_users (user_id, last_check, count, sol_erda_pieces) VALUES (?, ?, ?, ?)",
+            (member.id, today_str, count, pieces),
+        )
     else:
-        last_check, count = row
+        last_check, count, pieces = row
         if last_check != today_str:
             count += 1
+            if count % 7 == 0:
+                pieces += 5
+                reward_msg = "\n🎉 **누적 출석 7일 달성!** 솔 에르다 조각 **5개**가 지급되었습니다!"
             cursor.execute(
-                "UPDATE attendance_users SET last_check = ?, count = ? WHERE user_id = ?",
-                (today_str, count, member.id),
+                "UPDATE attendance_users SET last_check = ?, count = ?, sol_erda_pieces = ? WHERE user_id = ?",
+                (today_str, count, pieces, member.id),
             )
     conn.commit()
     cursor.execute(
@@ -454,29 +468,37 @@ async def process_attendance(member, today_str):
     channel = member.guild.get_channel(channel_row[0])
     if not channel:
         return
+
+    # 다음 보상까지 남은 일수 계산 (7일 주기)
+    remainder = count % 7
+    days_left = 7 - remainder if remainder != 0 else 0
+    if days_left == 0:
+        days_left = 7
+
+    base_desc = (
+        f"🗓️ 오늘 날짜: `{today_str}`\n"
+        f"📊 누적 출석 일수: **{count}일**\n"
+        f"💎 보유 솔 에르다 조각: **{pieces}개**\n"
+        f"⏳ 다음 보상까지: 앞으로 **{days_left}일** 남았습니다."
+    )
+    if reward_msg:
+        base_desc += f"\n{reward_msg}"
+
     if count == 1: 
         await channel.send(
-            f"🐣 {member.mention}님 천 리 길도 한 걸음부터입니다!\n"
-            f"🗓️ 오늘 날짜: `{today_str}`\n"
-            f"📊 누적 출석 일수: **{count}일**"
+            f"🐣 {member.mention}님 천 리 길도 한 걸음부터입니다!\n" + base_desc
         )
     elif count % 15 == 0 and count < 30:
         await channel.send(
-            f"🐣 {member.mention}님 시작이 반입니다! 축하드립니다!\n"
-            f"🗓️ 오늘 날짜: `{today_str}`\n"
-            f"📊 누적 출석 일수: **{count}일**"
+            f"🐣 {member.mention}님 시작이 반입니다! 축하드립니다!\n" + base_desc
         )
     elif count % 30 == 0 and count != 0:
         await channel.send(
-            f"🐣 {member.mention}님 수고하셨습니다! 대단합니다!\n"
-            f"🗓️ 오늘 날짜: `{today_str}`\n"
-            f"📊 누적 출석 일수: **{count}일**"
+            f"🐣 {member.mention}님 수고하셨습니다! 대단합니다!\n" + base_desc
         )
     else:
         await channel.send(
-            f"✅ {member.mention}님 오늘 출석이 완료되었습니다!\n"
-            f"🗓️ 오늘 날짜: `{today_str}`\n"
-            f"📊 누적 출석 일수: **{count}일**"
+            f"✅ {member.mention}님 오늘 출석이 완료되었습니다!\n" + base_desc
         )
 
 @bot.tree.error
@@ -527,7 +549,7 @@ async def register_sale_post(interaction: discord.Interaction):
     embed.add_field(name="판매글 등록하기", value="판매글등록을 하기 위해서 아래 버튼을 눌러주세요", inline=False)
     await interaction.response.send_message(embed=embed, view=Saleview(seller=interaction.user), ephemeral=False)
 
-@bot.tree.command(name="출석확인", description="누적 출석 일수를 확인합니다.")
+@bot.tree.command(name="출석확인", description="누적 출석 일수와 솔 에르다 조각 정보를 확인합니다.")
 async def check_attendance(interaction: discord.Interaction):
     user_id = interaction.user.id
     today_str = datetime.now(KST).strftime("%Y-%m-%d")
@@ -535,29 +557,65 @@ async def check_attendance(interaction: discord.Interaction):
     conn = sqlite3.connect("integrated.db")
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT last_check, count FROM attendance_users WHERE user_id = ?", (user_id,)
+        "SELECT last_check, count, COALESCE(sol_erda_pieces, 0) FROM attendance_users WHERE user_id = ?", (user_id,)
     )
     row = cursor.fetchone()
 
     if row is None:
         cursor.execute(
-            "INSERT INTO attendance_users (user_id, last_check, count) VALUES (?, ?, ?)",
-            (user_id, today_str, 0),
+            "INSERT INTO attendance_users (user_id, last_check, count, sol_erda_pieces) VALUES (?, ?, ?, ?)",
+            (user_id, today_str, 0, 0),
         )
         conn.commit()
-        await interaction.response.send_message(
-            f"🐣 아직 출석을 하지 않았습니다, {interaction.user.mention}님\n"
-            f"🗓️ 오늘 날짜: `{today_str}`\n"
-            f"📊 누적 출석 일수: **0일**"
-        )
+        count = 0
+        pieces = 0
     else:
-        last_check, count = row
-        await interaction.response.send_message(
-            f"✅ {interaction.user.mention}님 현재까지의 출석 일수입니다.\n"
-            f"🗓️ 오늘 날짜: `{today_str}`\n"
-            f"📊 누적 출석 일수: **{count}일**"
-        )
+        last_check, count, pieces = row
+
     conn.close()
+
+    remainder = count % 7
+    days_left = 7 - remainder if remainder != 0 else 0
+    if days_left == 0:
+        days_left = 7
+
+    await interaction.response.send_message(
+        f"✅ {interaction.user.mention}님의 출석 및 조각 정보입니다.\n"
+        f"🗓️ 오늘 날짜: `{today_str}`\n"
+        f"📊 누적 출석 일수: **{count}일**\n"
+        f"💎 보유 솔 에르다 조각: **{pieces}개**\n"
+        f"⏳ 다음 보상까지: 앞으로 **{days_left}일** 남았습니다."
+    )
+
+# 관리자용 출석 관련 설정 및 조각 수정 명령어
+@bot.tree.command(name="출석", description="출석 및 솔 에르다 조각 관리 명령어입니다.")
+@app_commands.describe(
+    action="수행할 작업",
+    user="대상이 되는 유저",
+    amount="설정할 솔 에르다 조각 개수"
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="조각수정", value="조각수정")
+])
+@app_commands.checks.has_permissions(administrator=True)
+async def attendance_admin(interaction: discord.Interaction, action: str, user: discord.Member, amount: int):
+    if action == "조각수정":
+        conn = sqlite3.connect("integrated.db")
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT user_id FROM attendance_users WHERE user_id = ?", (user.id,))
+        row = cursor.fetchone()
+        
+        if row:
+            cursor.execute("UPDATE attendance_users SET sol_erda_pieces = ? WHERE user_id = ?", (amount, user.id))
+        else:
+            today_str = datetime.now(KST).strftime("%Y-%m-%d")
+            cursor.execute("INSERT INTO attendance_users (user_id, last_check, count, sol_erda_pieces) VALUES (?, ?, 0, ?)", (user.id, today_str, amount))
+            
+        conn.commit()
+        conn.close()
+
+        await interaction.response.send_message(f"✅ {user.mention}님의 솔 에르다 조각 개수가 **{amount}개**로 수정되었습니다.", ephemeral=True)
 
 USER_COOLDOWNS = {}
 
