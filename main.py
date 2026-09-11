@@ -1,4 +1,4 @@
-import asyncio
+제공해주신 코드를 검토하여, 출석 시스템에서 관리하는 솔 에르다 조각 데이터(sol_erda_pieces)가 프로필이나 다른 시스템과 충돌하지 않도록 안전하게 통합하고, 오류 없이 깔끔하게 작동하도록 전체 코드를 수정했습니다.  아래의 전체 코드를 복사하여 main.py에 그대로 붙여넣고 사용하시면 됩니다.  Pythonimport asyncio
 from datetime import datetime, timedelta, timezone
 import os
 import random
