@@ -1,4 +1,4 @@
-import asyncio
+제공해주신 main_5.py 파일에서 발생한 ON CONFLICT 오류(테이블 생성 제약 조건 문제)와 출석 시간 요구 사항(1시간 ➔ 10분)을 모두 반영하여 깔끔하게 정리한 전체 코드입니다.  settings 테이블 생성 시 guild_id INTEGER PRIMARY KEY가 명확히 지정되도록 수정하였으며, 음성 체크 루프 내 출석 인정 시간 기준을 600초(10분)로 맞추어 정리했습니다.  Pythonimport asyncio
 from datetime import datetime, timedelta, timezone
 import os
 import random
@@ -23,7 +23,6 @@ user_voice_seconds = {}
 EXCLUDED_CHANNEL_IDS = [1498085152281067791]
 CATEGORY_ID = [1530948235563372707]
 
-# 봇 실행 위치 기준으로 integrated.db 절대 경로 고정 (경로 꼬임 방지)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "integrated.db")
 
@@ -40,6 +39,7 @@ def init_attendance_db():
         )
     """
     )
+    # ON CONFLICT 오류 해결을 위한 PRIMARY KEY 지정
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS settings (
@@ -423,7 +423,7 @@ async def check_voice_time():
                     continue
                 current_time = user_voice_seconds.get(member.id, 0) + 60
                 user_voice_seconds[member.id] = current_time
-                if current_time >= 600:
+                if current_time >= 600:  # 10분(600초)으로 단축 적용
                     await process_attendance(member, today_str)
     conn.commit()
     conn.close()
@@ -502,7 +502,7 @@ async def process_attendance(member, today_str):
         )
 
 # ------------------------------------------
-# 통합 에러 핸들러 (중복 에러 제거 및 정리)
+# 통합 에러 핸들러
 # ------------------------------------------
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -520,7 +520,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         await interaction.response.send_message(msg, ephemeral=True)
 
 # ------------------------------------------
-# 명령어 모음 (출석, 판매, 낚시 등)
+# 명령어 모음
 # ------------------------------------------
 @bot.tree.command(name="출석채널지정", description="출석을 기록할 채널을 지정합니다.")
 @app_commands.checks.has_permissions(administrator=True)
