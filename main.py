@@ -30,7 +30,7 @@ def init_integrated_db():
     conn = sqlite3.connect(DB_PATH) 
     cursor = conn.cursor()
     
-    # 출석 및 유저 설정 통합 테이블 (DROP 문 제거로 데이터 유실 방지)[cite: 3]
+    # 출석 및 유저 설정 통합 테이블
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS attendance_users (
@@ -44,7 +44,7 @@ def init_integrated_db():
         """
     )
     
-    # 서버별 설정 테이블 (DROP 문 제거로 봇 재시작 시 설정 초기화 방지)[cite: 3]
+    # 서버별 설정 테이블 (안전한 기본키 보장을 위해 임시 테이블 교체 방식 활용)
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS settings (
@@ -54,7 +54,7 @@ def init_integrated_db():
         """
     )
     
-    # 안전성 확보를 위한 컬럼 마이그레이션 (기존 DB 구조와의 충돌 방지)[cite: 3]
+    # 안전성 확보를 위한 컬럼 마이그레이션
     for col_def in [
         ("sol_erda_pieces", "INTEGER DEFAULT 0"),
         ("birthday", "TEXT")
@@ -88,7 +88,7 @@ def keep_alive():
 keep_alive()
 
 # ----------------------------------------
-# Supabase DB 세팅 (낚시 게임용)[cite: 3]
+# Supabase DB 세팅 (낚시 게임용)
 # ----------------------------------------
 DATABASE_URL = os.getenv('DATABASE_URL')
 
@@ -637,34 +637,30 @@ async def check_attendance(interaction: discord.Interaction):
         f"⏳ 다음 보상까지: 앞으로 **{days_left}일** 남았습니다."
     )
 
-@bot.tree.command(name="출석", description="출석 및 솔 에르다 조각 관리 명령어입니다.")
+@bot.tree.command(name="출석수정", description="관리자 권한으로 특정 유저의 누적 출석 일수나 솔 에르다 조각 개수를 강제로 수정합니다.")
 @app_commands.describe(
-    action="수행할 작업",
     user="대상이 되는 유저",
-    amount="설정할 솔 에르다 조각 개수"
+    days="변경할 누적 출석 일수 (변경하지 않으려면 현재 값 입력)",
+    pieces="변경할 솔 에르다 조각 개수 (변경하지 않으려면 현재 값 입력)"
 )
-@app_commands.choices(action=[
-    app_commands.Choice(name="조각수정", value="조각수정")
-])
 @app_commands.checks.has_permissions(administrator=True)
-async def attendance_admin(interaction: discord.Interaction, action: str, user: discord.Member, amount: int):
-    if action == "조각수정":
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+async def modify_attendance(interaction: discord.Interaction, user: discord.Member, days: int, pieces: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT user_id FROM attendance_users WHERE user_id = ?", (user.id,))
+    row = cursor.fetchone()
+    
+    if row:
+        cursor.execute("UPDATE attendance_users SET count = ?, sol_erda_pieces = ? WHERE user_id = ?", (days, pieces, user.id))
+    else:
+        today_str = datetime.now(KST).strftime("%Y-%m-%d")
+        cursor.execute("INSERT INTO attendance_users (user_id, last_check, count, sol_erda_pieces) VALUES (?, ?, ?, ?)", (user.id, today_str, days, pieces))
         
-        cursor.execute("SELECT user_id FROM attendance_users WHERE user_id = ?", (user.id,))
-        row = cursor.fetchone()
-        
-        if row:
-            cursor.execute("UPDATE attendance_users SET sol_erda_pieces = ? WHERE user_id = ?", (amount, user.id))
-        else:
-            today_str = datetime.now(KST).strftime("%Y-%m-%d")
-            cursor.execute("INSERT INTO attendance_users (user_id, last_check, count, sol_erda_pieces) VALUES (?, ?, 0, ?)", (user.id, today_str, amount))
-            
-        conn.commit()
-        conn.close()
+    conn.commit()
+    conn.close()
 
-        await interaction.response.send_message(f"✅ {user.mention}님의 솔 에르다 조각 개수가 **{amount}개**로 수정되었습니다.", ephemeral=True)
+    await interaction.response.send_message(f"✅ {user.mention}님의 누적 출석 일수가 **{days}일**, 솔 에르다 조각이 **{pieces}개**로 강제 수정되었습니다.", ephemeral=True)
 
 @bot.tree.command(name="생일등록", description="본인의 생일을 등록합니다. (형식: MM-DD)")
 @app_commands.describe(날짜="월-일 형식으로 입력하세요 (예: 12-25)")
@@ -816,7 +812,7 @@ async def fish(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ 낚시 중 오류가 발생했습니다:\n```{e}```")
 
 # ------------------------------------------
-# 봇 실행부 (토큰 처리)[cite: 3]
+# 봇 실행부 (토큰 처리)
 # ------------------------------------------
 TOKEN = os.getenv("DISCORD_TOKEN")
 if TOKEN:
