@@ -812,5 +812,14 @@ async def fish(interaction: discord.Interaction):
 
         await interaction.followup.send(embed=embed)
 
-except Exception as e:
-    await interaction.followup.send(f"❌ 낚시 중 오류가 발생했습니다:\n```{e}```")
+    except Exception as e:
+        await interaction.followup.send(f"❌ 낚시 중 오류가 발생했습니다:\n```{e}```")
+
+# ------------------------------------------
+# 봇 실행부 (토큰 처리)[cite: 3]
+# ------------------------------------------
+TOKEN = os.getenv("DISCORD_TOKEN")
+if TOKEN:
+    bot.run(TOKEN)
+else:
+    print("디스코드 토큰이 설정되지 않았습니다.")
