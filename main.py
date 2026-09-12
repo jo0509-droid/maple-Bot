@@ -15,7 +15,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 # ----------------------------------------
-# 타임존 및 절대 경로 DB 설정 (출석/음성용)
+# 타임존 및 절대 경로 DB 설정 (통합 출석/게임/설정)
 # ----------------------------------------
 KST = timezone(timedelta(hours=9))
 user_voice_seconds = {}
@@ -26,39 +26,43 @@ CATEGORY_ID = [1530948235563372707]
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "integrated.db")
 
-def init_attendance_db():
+def init_integrated_db():
     conn = sqlite3.connect(DB_PATH) 
     cursor = conn.cursor()
+    
+    # 출석 및 유저 설정 통합 테이블 (DROP 문 제거로 데이터 유실 방지)
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS attendance_users (
             user_id INTEGER PRIMARY KEY,
             last_check TEXT,
             count INTEGER DEFAULT 0,
-            last_voice_at TEXT
+            last_voice_at TEXT,
+            sol_erda_pieces INTEGER DEFAULT 0,
+            birthday TEXT
         )
-    """
+        """
     )
-    # 기존 설정 테이블의 제약 조건 충돌 문제를 해결하기 위해 드롭 후 재생성 (출석 데이터는 유지됨)
-    cursor.execute("DROP TABLE IF EXISTS settings;")
+    
+    # 서버별 설정 테이블 (DROP 문 제거로 봇 재시작 시 설정 초기화 방지)
     cursor.execute(
         """
-        CREATE TABLE settings (
+        CREATE TABLE IF NOT EXISTS settings (
             guild_id INTEGER PRIMARY KEY,
             channel_id INTEGER
         )
-    """
+        """
     )
-    try:
-        cursor.execute("ALTER TABLE attendance_users ADD COLUMN sol_erda_pieces INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-
-    # [추가] 기존 DB 테이블에 birthday 컬럼이 없다면 안전하게 추가합니다
-    try:
-        cursor.execute("ALTER TABLE attendance_users ADD COLUMN birthday TEXT")
-    except sqlite3.OperationalError:
-        pass
+    
+    # 안전성 확보를 위한 컬럼 마이그레이션 (기존 DB 구조와의 충돌 방지)
+    for col_def in [
+        ("sol_erda_pieces", "INTEGER DEFAULT 0"),
+        ("birthday", "TEXT")
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE attendance_users ADD COLUMN {col_def[0]} {col_def[1]}")
+        except sqlite3.OperationalError:
+            pass
 
     conn.commit()
     conn.close()
@@ -286,7 +290,7 @@ class SaleModal(discord.ui.Modal, title="판매글 등록"):
         sale_comment = self.sale_comment.value
 
         embed = discord.Embed(title="메소 팔아요", color=discord.Color.green())
-        embed.add_field(name="", value=sale_amount + "억 메소를 억당" + sale_price + "원으로 판매합니다", inline=False)
+        embed.add_field(name="", value=f"{sale_amount}억 메소를 억당 {sale_price}원으로 판매합니다", inline=False)
         embed.add_field(name="", value=sale_comment if sale_comment else "", inline=False)
         embed.set_footer(text="구매를 누르면 바로 채널이 생성되니 주의해주세요!")
         main_view = buybutton(seller=seller)
@@ -360,7 +364,7 @@ class buybutton(discord.ui.View):
 # ------------------------------------------
 @bot.event
 async def on_ready():
-    init_attendance_db()
+    init_integrated_db()
     if not check_voice_time.is_running():
         check_voice_time.start()
     print(f'로그인 성공: {bot.user.name}')
@@ -431,7 +435,6 @@ async def check_voice_time():
     now = datetime.now(KST)
     today_str = now.strftime("%Y-%m-%d")
     if now.hour == 0 and now.minute == 0:
-        # [추가] 자정이 되면 오늘 날짜(MM-DD)를 파악해 생일 체크 함수 실행
         today_md = now.strftime("%m-%d")
         await check_and_send_birthdays(today_md)
 
@@ -475,7 +478,7 @@ async def check_voice_time():
                     continue
                 current_time = user_voice_seconds.get(member.id, 0) + 60
                 user_voice_seconds[member.id] = current_time
-                if current_time >= 600:  # 10분(600초) 단축
+                if current_time >= 600:
                     await process_attendance(member, today_str)
     conn.commit()
     conn.close()
@@ -663,7 +666,6 @@ async def attendance_admin(interaction: discord.Interaction, action: str, user: 
 
         await interaction.response.send_message(f"✅ {user.mention}님의 솔 에르다 조각 개수가 **{amount}개**로 수정되었습니다.", ephemeral=True)
 
-# [추가] 생일 등록 명령어
 @bot.tree.command(name="생일등록", description="본인의 생일을 등록합니다. (형식: MM-DD)")
 @app_commands.describe(날짜="월-일 형식으로 입력하세요 (예: 12-25)")
 async def register_birthday(interaction: discord.Interaction, 날짜: str):
