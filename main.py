@@ -44,15 +44,18 @@ def init_integrated_db():
         """
     )
     
-    # 서버별 설정 테이블 (안전한 기본키 보장을 위해 임시 테이블 교체 방식 활용)
+    # 서버별 설정 테이블 (기존 테이블 충돌 방지 및 안전한 기본키 보장)
     cursor.execute(
         """
-        CREATE TABLE IF NOT EXISTS settings (
+        CREATE TABLE IF NOT EXISTS settings_new (
             guild_id INTEGER PRIMARY KEY,
             channel_id INTEGER
         )
         """
     )
+    cursor.execute("INSERT OR IGNORE INTO settings_new SELECT guild_id, channel_id FROM settings")
+    cursor.execute("DROP TABLE IF EXISTS settings")
+    cursor.execute("ALTER TABLE settings_new RENAME TO settings")
     
     # 안전성 확보를 위한 컬럼 마이그레이션
     for col_def in [
@@ -640,8 +643,8 @@ async def check_attendance(interaction: discord.Interaction):
 @bot.tree.command(name="출석수정", description="관리자 권한으로 특정 유저의 누적 출석 일수나 솔 에르다 조각 개수를 강제로 수정합니다.")
 @app_commands.describe(
     user="대상이 되는 유저",
-    days="변경할 누적 출석 일수 (변경하지 않으려면 현재 값 입력)",
-    pieces="변경할 솔 에르다 조각 개수 (변경하지 않으려면 현재 값 입력)"
+    days="변경할 누적 출석 일수",
+    pieces="변경할 솔 에르다 조각 개수"
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def modify_attendance(interaction: discord.Interaction, user: discord.Member, days: int, pieces: int):
@@ -810,6 +813,41 @@ async def fish(interaction: discord.Interaction):
 
     except Exception as e:
         await interaction.followup.send(f"❌ 낚시 중 오류가 발생했습니다:\n```{e}```")
+
+# 추가 낚시 관련 보조 명령어들 (정보, 낚시터이동, 낚시대강화 등)
+@bot.tree.command(name="내정보", description="현재 캐릭터의 레벨, 경험치, 메소, 장비 정보를 확인합니다.")
+async def my_info(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        user_info = await get_user_data(interaction.user.id)
+        max_exp = get_max_exp(user_info["level"])
+        embed = discord.Embed(title=f"📊 {interaction.user.display_name}님의 캐릭터 정보", color=0x3498DB)
+        embed.add_field(name="레벨", value=f"Lv. {user_info['level']}", inline=True)
+        embed.add_field(name="경험치", value=f"{user_info['exp']:,} / {max_exp:,}", inline=True)
+        embed.add_field(name="메소", value=f"{user_info['meso']:,} 메소", inline=True)
+        embed.add_field(name="솔 에르다", value=f"{user_info['sol_erda']} 개", inline=True)
+        embed.add_field(name="현재 지역", value=user_info["region"], inline=True)
+        embed.add_field(name="보유 낚시대", value=user_info["rod"], inline=True)
+        embed.set_footer(text=f"상자 오픈 횟수: {user_info['chests_opened']}회")
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ 정보를 불러오는 중 오류가 발생했습니다:\n```{e}```", ephemeral=True)
+
+@bot.tree.command(name="낚시터이동", description="원하는 낚시터로 이동합니다.")
+@app_commands.describe(지역="이동할 낚시터 이름을 입력하세요")
+async def move_spot(interaction: discord.Interaction, 지역: str):
+    await interaction.response.defer(ephemeral=True)
+    if 지역 not in SPOTS:
+        await interaction.followup.send(f"❌ 존재하지 않는 낚시터입니다. 가능한 지역: {', '.join(SPOTS.keys())}", ephemeral=True)
+        return
+    user_info = await get_user_data(interaction.user.id)
+    req_lvl = SPOTS[지역]["req_lvl"]
+    if user_info["level"] < req_lvl:
+        await interaction.followup.send(f"❌ 레벨이 부족하여 **{지역}**(입장 제한: Lv. {req_lvl})에 갈 수 없습니다.", ephemeral=True)
+        return
+    user_info["region"] = 지역
+    await update_user_data(interaction.user.id, user_info)
+    await interaction.followup.send(f"✅ 성공적으로 **{지역}** 낚시터로 이동했습니다!", ephemeral=True)
 
 # ------------------------------------------
 # 봇 실행부 (토큰 처리)
