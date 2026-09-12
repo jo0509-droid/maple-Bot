@@ -54,6 +54,12 @@ def init_attendance_db():
     except sqlite3.OperationalError:
         pass
 
+    # [추가] 기존 DB 테이블에 birthday 컬럼이 없다면 안전하게 추가합니다
+    try:
+        cursor.execute("ALTER TABLE attendance_users ADD COLUMN birthday TEXT")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -389,11 +395,46 @@ async def on_voice_state_update(member, before, after):
         if member.id not in user_voice_seconds:
             user_voice_seconds[member.id] = 0
 
+async def check_and_send_birthdays(today_md):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM attendance_users WHERE birthday = ?", (today_md,))
+    birthday_users = cursor.fetchall()
+    
+    cursor.execute("SELECT guild_id, channel_id FROM settings WHERE channel_id IS NOT NULL")
+    settings_rows = cursor.fetchall()
+    conn.close()
+
+    if not birthday_users or not settings_rows:
+        return
+
+    for guild_id, channel_id in settings_rows:
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            continue
+        channel = guild.get_channel(channel_id)
+        if not channel:
+            continue
+
+        for (user_id,) in birthday_users:
+            member = guild.get_member(user_id)
+            if member:
+                embed = discord.Embed(
+                    title="🎉 생일을 축하합니다! 🎂",
+                    description=f"오늘은 {member.mention}님의 생일입니다! 모두 따뜻한 축하를 보내주세요! 🥳",
+                    color=0xFF69B4
+                )
+                await channel.send(embed=embed)
+
 @tasks.loop(minutes=1)
 async def check_voice_time():
     now = datetime.now(KST)
     today_str = now.strftime("%Y-%m-%d")
     if now.hour == 0 and now.minute == 0:
+        # [추가] 자정이 되면 오늘 날짜(MM-DD)를 파악해 생일 체크 함수 실행
+        today_md = now.strftime("%m-%d")
+        await check_and_send_birthdays(today_md)
+
         user_voice_seconds.clear()
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -621,6 +662,37 @@ async def attendance_admin(interaction: discord.Interaction, action: str, user: 
         conn.close()
 
         await interaction.response.send_message(f"✅ {user.mention}님의 솔 에르다 조각 개수가 **{amount}개**로 수정되었습니다.", ephemeral=True)
+
+# [추가] 생일 등록 명령어
+@bot.tree.command(name="생일등록", description="본인의 생일을 등록합니다. (형식: MM-DD)")
+@app_commands.describe(날짜="월-일 형식으로 입력하세요 (예: 12-25)")
+async def register_birthday(interaction: discord.Interaction, 날짜: str):
+    if len(날짜) != 5 or 날짜[2] != '-':
+        await interaction.response.send_message("❌ 형식에 맞지 않습니다. `MM-DD` 형식으로 입력해주세요 (예: `12-25`).", ephemeral=True)
+        return
+
+    user_id = interaction.user.id
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT user_id FROM attendance_users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    
+    if row is None:
+        cursor.execute(
+            "INSERT INTO attendance_users (user_id, count, sol_erda_pieces, birthday) VALUES (?, 0, 0, ?)",
+            (user_id, 날짜)
+        )
+    else:
+        cursor.execute(
+            "UPDATE attendance_users SET birthday = ? WHERE user_id = ?",
+            (날짜, user_id)
+        )
+        
+    conn.commit()
+    conn.close()
+    
+    await interaction.response.send_message(f"✅ 생일이 `{날짜}`로 성공적으로 등록되었습니다!", ephemeral=True)
 
 USER_COOLDOWNS = {}
 
