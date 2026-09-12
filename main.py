@@ -812,5 +812,5 @@ async def fish(interaction: discord.Interaction):
 
         await interaction.followup.send(embed=embed)
 
-    except Exception as e:
-        await interaction.followup.send(f"❌ 낚시 중 오류가 발생했습니다:\n```{e}
+except Exception as e:
+    await interaction.followup.send(f"❌ 낚시 중 오류가 발생했습니다:\n```{e}```")
