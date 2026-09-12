@@ -30,7 +30,7 @@ def init_integrated_db():
     conn = sqlite3.connect(DB_PATH) 
     cursor = conn.cursor()
     
-    # 출석 및 유저 설정 통합 테이블 (DROP 문 제거로 데이터 유실 방지)
+    # 출석 및 유저 설정 통합 테이블 (DROP 문 제거로 데이터 유실 방지)[cite: 3]
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS attendance_users (
@@ -44,7 +44,7 @@ def init_integrated_db():
         """
     )
     
-    # 서버별 설정 테이블 (DROP 문 제거로 봇 재시작 시 설정 초기화 방지)
+    # 서버별 설정 테이블 (DROP 문 제거로 봇 재시작 시 설정 초기화 방지)[cite: 3]
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS settings (
@@ -54,7 +54,7 @@ def init_integrated_db():
         """
     )
     
-    # 안전성 확보를 위한 컬럼 마이그레이션 (기존 DB 구조와의 충돌 방지)
+    # 안전성 확보를 위한 컬럼 마이그레이션 (기존 DB 구조와의 충돌 방지)[cite: 3]
     for col_def in [
         ("sol_erda_pieces", "INTEGER DEFAULT 0"),
         ("birthday", "TEXT")
@@ -88,7 +88,7 @@ def keep_alive():
 keep_alive()
 
 # ----------------------------------------
-# Supabase DB 세팅 (낚시 게임용)
+# Supabase DB 세팅 (낚시 게임용)[cite: 3]
 # ----------------------------------------
 DATABASE_URL = os.getenv('DATABASE_URL')
 
@@ -813,210 +813,4 @@ async def fish(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
-        await interaction.followup.send(f"❌ 낚시 중 오류가 발생했습니다:\n```{e}```")
-
-@bot.tree.command(name="레벨랭킹", description="가장 레벨이 높은 모험가 TOP 10을 확인합니다.")
-async def level_ranking(interaction: discord.Interaction):
-    await interaction.response.defer()
-
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT user_id, level, exp FROM users ORDER BY level DESC, exp DESC LIMIT 10")
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        embed = discord.Embed(title="🏆 메이플 낚시왕 레벨 랭킹 TOP 10", color=0xF1C40F)
-
-        if not rows:
-            embed.description = "아직 등록된 모험가가 없습니다."
-        else:
-            rank_text = ""
-            medals = ["🥇", "🥈", "🥉"]
-            for idx, row in enumerate(rows, start=1):
-                u_id, level, exp = row['user_id'], row['level'], row['exp']
-                medal = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
-
-                user_obj = bot.get_user(u_id)
-                if not user_obj:
-                    try:
-                        user_obj = await bot.fetch_user(u_id)
-                    except:
-                        pass
-                user_name = user_obj.display_name if user_obj else f"유저({u_id})"
-
-                rank_text += f"{medal} **{user_name}** - Lv. {level} ({exp:,} EXP)\n"
-
-            embed.description = rank_text
-
-        await interaction.followup.send(embed=embed)
-
-    except Exception as e:
-        print(f"레벨랭킹 오류: {e}")
-        await interaction.followup.send("❌ 랭킹을 불러오는 데 실패했습니다.", ephemeral=True)
-
-@bot.tree.command(name="상자랭킹", description="보물상자를 가장 많이 획득한 모험가 TOP 10을 확인합니다.")
-async def chest_ranking(interaction: discord.Interaction):
-    await interaction.response.defer()
-
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT user_id, chests_opened FROM users WHERE chests_opened > 0 ORDER BY chests_opened DESC LIMIT 10")
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        embed = discord.Embed(title="🎁 행운의 보물상자 랭킹 TOP 10", color=0x9B59B6)
-
-        if not rows:
-            embed.description = "아직 보물상자를 낚은 모험가가 없습니다."
-        else:
-            rank_text = ""
-            medals = ["🥇", "🥈", "🥉"]
-            for idx, row in enumerate(rows, start=1):
-                u_id, chests = row['user_id'], row['chests_opened']
-                medal = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
-
-                user_obj = bot.get_user(u_id)
-                if not user_obj:
-                    try:
-                        user_obj = await bot.fetch_user(u_id)
-                    except:
-                        pass
-                user_name = user_obj.display_name if user_obj else f"유저({u_id})"
-
-                rank_text += f"{medal} **{user_name}** - 총 **{chests:,}개** 획득\n"
-
-            embed.description = rank_text
-
-        await interaction.followup.send(embed=embed)
-
-    except Exception as e:
-        print(f"상자랭킹 오류: {e}")
-        await interaction.followup.send("❌ 상자 랭킹을 불러오는 데 실패했습니다.", ephemeral=True)
-
-@bot.tree.command(name="프로필", description="내 정보 또는 다른 유저의 정보를 확인합니다.")
-async def profile(interaction: discord.Interaction, 유저: discord.User = None):
-    await interaction.response.defer()
-    target_user = 유저 if 유저 else interaction.user
-    user_info = await get_user_data(target_user.id)
-    max_exp = get_max_exp(user_info["level"])
-    exp_str = f"{user_info['exp']:,} / {max_exp:,} EXP" if user_info["level"] < 1000 else "MAX"
-    current_rod = user_info["rod"]
-
-    embed = discord.Embed(title=f"🍁 {target_user.name}님의 모험가 정보", color=0xF1C40F)
-    embed.add_field(name="레벨", value=f"Lv. {user_info['level']}", inline=True)
-    embed.add_field(name="경험치", value=exp_str, inline=True)
-    embed.add_field(name="착용 낚시대", value=f"🎣 **{current_rod}**", inline=False)
-    embed.add_field(name="현재 낚시터", value=f"📍 {user_info['region']}", inline=False)
-    embed.add_field(name="보유 재화", value=f"💰 {user_info['meso']:,} 메소 | 💎 조각: {user_info['sol_erda']:,}개", inline=False)
-    embed.add_field(name="획득한 보물상자", value=f"🎁 **{user_info['chests_opened']:,}개**", inline=False)
-    await interaction.followup.send(embed=embed)
-
-@bot.tree.command(name="조각구매", description="메소를 소모하여 솔 에르다 조각을 구매합니다. (1개당 10만 메소)")
-async def buy_erda(interaction: discord.Interaction, 수량: int):
-    await interaction.response.defer()
-    if 수량 <= 0:
-        await interaction.followup.send("❌ 구매 수량은 1개 이상이어야 합니다.", ephemeral=True)
-        return
-
-    user_id = interaction.user.id
-    user_info = await get_user_data(user_id)
-
-    cost = 수량 * 100000
-    if user_info["meso"] < cost:
-        await interaction.followup.send(f"❌ 메소가 부족합니다! (필요: {cost:,} 메소)", ephemeral=True)
-        return
-
-    user_info["meso"] -= cost
-    user_info["sol_erda"] += 수량
-    await update_user_data(user_id, user_info)
-    
-    msg = f"💰 **{cost:,} 메소**를 소모하여 솔 에르다 조각 **{수량}개**를 구매했습니다!"
-    await interaction.followup.send(msg)
-
-@bot.tree.command(name="낚시터목록", description="낚시터 목록을 확인합니다.")
-async def spot_list(interaction: discord.Interaction):
-    await interaction.response.defer()
-    embed = discord.Embed(title="🗺️ 메이플 낚시터 안내판", color=0x3498DB)
-    for name, info in SPOTS.items():
-        embed.add_field(
-            name=f"📍 {name}",
-            value=f"입장 제한: **Lv. {info['req_lvl']}**\n쿨타임: **{info['cooldown']}초**\n기본 상자확률: **{info['chest_chance']}%**",
-            inline=True
-        )
-    await interaction.followup.send(embed=embed)
-
-@bot.tree.command(name="이동", description="원하는 낚시터로 이동합니다.")
-@app_commands.choices(장소=[app_commands.Choice(name=s, value=s) for s in SPOTS.keys()])
-async def move_spot(interaction: discord.Interaction, 장소: str):
-    await interaction.response.defer()
-    user_info = await get_user_data(interaction.user.id)
-    spot_info = SPOTS.get(장소)
-
-    if user_info["level"] < spot_info["req_lvl"]:
-        await interaction.followup.send(
-            f"❌ 레벨이 부족합니다! ({장소} 필요 레벨: Lv. {spot_info['req_lvl']})", ephemeral=True
-        )
-        return
-
-    user_info["region"] = 장소
-    await update_user_data(interaction.user.id, user_info)
-    await interaction.followup.send(f"⛵ **[{장소}]**(으)로 이동했습니다!")
-
-@bot.tree.command(name="강화", description="메소를 소모하여 낚시대를 강화합니다.")
-async def upgrade_rod(interaction: discord.Interaction):
-    await interaction.response.defer()
-    user_info = await get_user_data(interaction.user.id)
-    current_rod = user_info["rod"]
-    rod_info = RODS.get(current_rod)
-    next_rod = rod_info["next"]
-
-    if not next_rod:
-        await interaction.followup.send("✨ 이미 최고 등급인 [전설의 낚시대]를 보유 중입니다!", ephemeral=True)
-        return
-
-    cost = rod_info["cost"]
-    if user_info["meso"] < cost:
-        await interaction.followup.send(f"❌ 메소가 부족합니다! (필요: {cost:,} 메소)", ephemeral=True)
-        return
-
-    user_info["meso"] -= cost
-    if random.randint(1, 100) <= rod_info["success_rate"]:
-        user_info["rod"] = next_rod
-        await update_user_data(interaction.user.id, user_info)
-        await interaction.followup.send(f"🎉 낚시대 강화 성공! **[{current_rod}]** ➔ **[{next_rod}]**")
-    else:
-        await update_user_data(interaction.user.id, user_info)
-        await interaction.followup.send(f"💥 강화 실패... **[{current_rod}]** 유지")
-
-@bot.tree.command(name="정보수정", description="[관리자용] 특정 유저의 레벨, 메소, 조각 등을 강제로 수정합니다.")
-@app_commands.default_permissions(administrator=True)
-@app_commands.choices(항목=[
-    app_commands.Choice(name="레벨", value="level"),
-    app_commands.Choice(name="메소", value="meso"),
-    app_commands.Choice(name="솔에르다조각", value="sol_erda"),
-    app_commands.Choice(name="경험치", value="exp")
-])
-async def admin_modify(interaction: discord.Interaction, 유저: discord.User, 항목: str, 수치: int):
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        user_info = await get_user_data(유저.id)
-        user_info[항목] = 수치
-        await update_user_data(유저.id, user_info)
-
-        await interaction.followup.send(f"✅ 성공적으로 **{유저.name}**님의 `{항목}`을(를) `{수치:,}`(으)로 수정했습니다.", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ 수정 중 오류 발생: {e}", ephemeral=True)
-
-# ------------------------------------------
-# 봇 실행부
-# ------------------------------------------
-TOKEN = os.getenv("DISCORD_TOKEN")
-if TOKEN:
-    bot.run(TOKEN)
-else:
-    print("디스코드 토큰이 설정되지 않았습니다.")
+        await interaction.followup.send(f"❌ 낚시 중 오류가 발생했습니다:\n```{e}
