@@ -190,6 +190,16 @@ TREASURE_SOL_ERDA = [
     {"amount": 5, "weight": 1},
 ]
 
+FORTUNES = [
+    "오늘 하루는 왠지 기분 좋은 일로 가득할 거예요! 힘내세요! ✨",
+    "당신은 생각보다 훨씬 더 멋지고 대단한 사람입니다. 🍀",
+    "오늘 흘린 노력의 결실이 곧 달콤한 보상으로 돌아올 거예요! 🌟",
+    "소소하지만 확실한 행복이 오늘 당신을 찾아올 거예요. ☕",
+    "주변 사람들에게 당신의 밝은 에너지를 나누어주는 멋진 하루가 될 거예요! ☀️",
+    "하고자 하는 모든 일이 순조롭게 풀리는 마법 같은 하루가 될 거예요! 🪄",
+    "오늘 당신의 미소는 주변 사람까지 행복하게 만들 거예요. 😊"
+]
+
 SPOTS = {
     "리스항구": {
         "req_lvl": 1, "fail_chance": 10, "cooldown": 10, "chest_chance": 0.2,
@@ -613,6 +623,17 @@ async def attendance_admin(interaction: discord.Interaction, action: str, user: 
         await interaction.response.send_message(f"✅ {user.mention}님의 솔 에르다 조각 개수가 **{amount}개**로 수정되었습니다.", ephemeral=True)
 
 USER_COOLDOWNS = {}
+
+@bot.tree.command(name="포춘쿠키", description="오늘의 행운의 포춘쿠키를 뽑고 행복한 문구를 확인합니다.")
+async def fortune_cookie(interaction: discord.Interaction):
+    selected_fortune = random.choice(FORTUNES)
+    embed = discord.Embed(
+        title="🥠 오늘의 포춘쿠키", 
+        description=selected_fortune, 
+        color=0xF1C40F
+    )
+    embed.set_footer(text=f"요청자: {interaction.user.display_name}", icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="낚시", description="현재 낚시터에서 낚시를 진행합니다.")
 async def fish(interaction: discord.Interaction):
