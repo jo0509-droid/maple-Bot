@@ -757,31 +757,48 @@ async def attendance_ranking(interaction: discord.Interaction):
 @app_commands.describe(
     action="수행할 작업",
     user="대상이 되는 유저",
-    amount="설정할 솔 에르다 조각 개수"
+    amount="설정할 값 (조각수정=솔 에르다 조각 개수 / 누적출석일수수정=누적 출석일수)"
 )
 @app_commands.choices(action=[
-    app_commands.Choice(name="조각수정", value="조각수정")
+    app_commands.Choice(name="조각수정", value="조각수정"),
+    app_commands.Choice(name="누적출석일수수정", value="누적출석일수수정")
 ])
 @app_commands.checks.has_permissions(administrator=True)
 async def attendance_admin(interaction: discord.Interaction, action: str, user: discord.Member, amount: int):
+    conn = get_db_connection_plain()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT user_id FROM attendance_users WHERE user_id = %s", (user.id,))
+    row = cursor.fetchone()
+    today_str = datetime.now(KST).strftime("%Y-%m-%d")
+
     if action == "조각수정":
-        conn = get_db_connection_plain()
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT user_id FROM attendance_users WHERE user_id = %s", (user.id,))
-        row = cursor.fetchone()
-        
         if row:
             cursor.execute("UPDATE attendance_users SET sol_erda_pieces = %s WHERE user_id = %s", (amount, user.id))
         else:
-            today_str = datetime.now(KST).strftime("%Y-%m-%d")
-            cursor.execute("INSERT INTO attendance_users (user_id, last_check, count, sol_erda_pieces) VALUES (%s, %s, 0, %s)", (user.id, today_str, amount))
-            
+            cursor.execute(
+                "INSERT INTO attendance_users (user_id, last_check, count, sol_erda_pieces) VALUES (%s, %s, 0, %s)",
+                (user.id, today_str, amount)
+            )
         conn.commit()
         cursor.close()
         conn.close()
 
         await interaction.response.send_message(f"✅ {user.mention}님의 솔 에르다 조각 개수가 **{amount}개**로 수정되었습니다.", ephemeral=True)
+
+    elif action == "누적출석일수수정":
+        if row:
+            cursor.execute("UPDATE attendance_users SET count = %s WHERE user_id = %s", (amount, user.id))
+        else:
+            cursor.execute(
+                "INSERT INTO attendance_users (user_id, last_check, count, sol_erda_pieces) VALUES (%s, %s, %s, 0)",
+                (user.id, today_str, amount)
+            )
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        await interaction.response.send_message(f"✅ {user.mention}님의 누적 출석일수가 **{amount}일**로 수정되었습니다.", ephemeral=True)
 
 USER_COOLDOWNS = {}
 
