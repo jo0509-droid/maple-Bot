@@ -461,15 +461,15 @@ async def on_ready():
     try:
         MY_GUILD = discord.Object(id=1498077956839313559)
 
-        # 예전에 전역(global)으로 동기화된 명령어가 남아있으면
-        # 길드 전용 명령어와 겹쳐 /명령어 목록에 같은 명령어가 두 개씩 뜨게 됩니다.
-        # 그래서 매 시작 시 전역 명령어를 먼저 비우고, 길드 전용으로만 동기화합니다.
-        bot.tree.clear_commands(guild=None)
-        await bot.tree.sync()  # 비워진 전역 명령어 목록을 디스코드 서버에 반영 (중복 제거)
-
+        # 1) 먼저 길드 전용으로 명령어를 복사 & 동기화합니다.
         bot.tree.copy_global_to(guild=MY_GUILD)
         synced = await bot.tree.sync(guild=MY_GUILD)
         print(f"Synced {len(synced)} command(s) to specific guild.")
+
+        # 2) 그 다음에 예전에 남아있을 수 있는 전역(global) 명령어를 비웁니다.
+        #    (순서가 바뀌면 길드 명령어까지 함께 사라지니 반드시 이 순서를 지켜야 합니다.)
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()
     except Exception as e:
         print(f"Failed to sync commands: {e}")
 
