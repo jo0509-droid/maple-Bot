@@ -34,10 +34,15 @@ def init_attendance_db():
             last_check TEXT,
             count INTEGER DEFAULT 0,
             last_voice_at TEXT,
-            sol_erda_pieces INTEGER DEFAULT 0
+            sol_erda_pieces INTEGER DEFAULT 0,
+            fortune_date TEXT,
+            fortune_count INTEGER DEFAULT 0
         )
         """
     )
+    # 기존에 이미 테이블이 있던 경우를 위한 컬럼 추가 (있으면 건너뜀 - 데이터 유지됨)
+    cursor.execute("ALTER TABLE attendance_users ADD COLUMN IF NOT EXISTS fortune_date TEXT")
+    cursor.execute("ALTER TABLE attendance_users ADD COLUMN IF NOT EXISTS fortune_count INTEGER DEFAULT 0")
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS settings (
@@ -706,6 +711,48 @@ async def check_attendance(interaction: discord.Interaction):
         f"⏳ 다음 보상까지: 앞으로 **{days_left}일** 남았습니다."
     )
 
+@bot.tree.command(name="출석랭킹", description="누적 출석일수가 가장 많은 모험가 TOP 10을 확인합니다.")
+async def attendance_ranking(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    try:
+        conn = get_db_connection_plain()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT user_id, count FROM attendance_users WHERE count > 0 ORDER BY count DESC LIMIT 10"
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        embed = discord.Embed(title="🗓️ 누적 출석 랭킹 TOP 10", color=0x1ABC9C)
+
+        if not rows:
+            embed.description = "아직 출석한 모험가가 없습니다."
+        else:
+            rank_text = ""
+            medals = ["🥇", "🥈", "🥉"]
+            for idx, (u_id, count) in enumerate(rows, start=1):
+                medal = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
+
+                user_obj = bot.get_user(u_id)
+                if not user_obj:
+                    try:
+                        user_obj = await bot.fetch_user(u_id)
+                    except:
+                        pass
+                user_name = user_obj.display_name if user_obj else f"유저({u_id})"
+
+                rank_text += f"{medal} **{user_name}** - 누적 **{count}일**\n"
+
+            embed.description = rank_text
+
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        print(f"출석랭킹 오류: {e}")
+        await interaction.followup.send("❌ 출석 랭킹을 불러오는 데 실패했습니다.", ephemeral=True)
+
 @bot.tree.command(name="출석", description="출석 및 솔 에르다 조각 관리 명령어입니다.")
 @app_commands.describe(
     action="수행할 작업",
@@ -738,14 +785,70 @@ async def attendance_admin(interaction: discord.Interaction, action: str, user: 
 
 USER_COOLDOWNS = {}
 
-@bot.tree.command(name="포춘쿠키", description="오늘의 행운의 포춘쿠키를 뽑고 행복한 문구를 확인합니다.")
+@bot.tree.command(name="포춘쿠키", description="오늘의 행운의 포춘쿠키를 뽑고 행복한 문구를 확인합니다. (하루 3회)")
 async def fortune_cookie(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    today_str = datetime.now(KST).strftime("%Y-%m-%d")
+
+    conn = get_db_connection_plain()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT fortune_date, COALESCE(fortune_count, 0), COALESCE(sol_erda_pieces, 0) FROM attendance_users WHERE user_id = %s",
+        (user_id,)
+    )
+    row = cursor.fetchone()
+
+    if row is None:
+        fortune_date, fortune_count, pieces = None, 0, 0
+    else:
+        fortune_date, fortune_count, pieces = row
+
+    # 날짜가 바뀌었으면 오늘 사용 횟수를 초기화
+    if fortune_date != today_str:
+        fortune_count = 0
+
+    if fortune_count >= 3:
+        cursor.close()
+        conn.close()
+        await interaction.response.send_message(
+            "🥠 오늘 포춘쿠키는 이미 **3번** 모두 뽑으셨어요! 내일 다시 찾아와주세요. 🌙",
+            ephemeral=True
+        )
+        return
+
+    fortune_count += 1
+
+    gained_piece = random.randint(1, 100) <= 5  # 5% 확률
+    if gained_piece:
+        pieces += 1
+
+    if row is None:
+        cursor.execute(
+            """
+            INSERT INTO attendance_users (user_id, fortune_date, fortune_count, sol_erda_pieces)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (user_id, today_str, fortune_count, pieces)
+        )
+    else:
+        cursor.execute(
+            "UPDATE attendance_users SET fortune_date = %s, fortune_count = %s, sol_erda_pieces = %s WHERE user_id = %s",
+            (today_str, fortune_count, pieces, user_id)
+        )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
     selected_fortune = random.choice(FORTUNES)
     embed = discord.Embed(
-        title="🥠 오늘의 포춘쿠키", 
-        description=selected_fortune, 
+        title="🥠 오늘의 포춘쿠키",
+        description=selected_fortune,
         color=0xF1C40F
     )
+    if gained_piece:
+        embed.add_field(name="🎉 깜짝 선물!", value="포춘쿠키 속에서 **솔 에르다 조각 1개**를 발견했습니다!", inline=False)
+    embed.add_field(name="💎 보유 솔 에르다 조각", value=f"{pieces:,}개", inline=True)
+    embed.add_field(name="🥠 오늘 남은 횟수", value=f"{3 - fortune_count}/3회", inline=True)
     embed.set_footer(text=f"요청자: {interaction.user.display_name}", icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
     await interaction.response.send_message(embed=embed)
 
