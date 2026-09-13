@@ -1,7 +1,6 @@
 from datetime import datetime, timedelta, timezone
 import os
 import random
-import sqlite3
 import asyncio
 
 import psycopg2
@@ -15,7 +14,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 # ----------------------------------------
-# 타임존 및 절대 경로 DB 설정 (출석/음성용)
+# 타임존 설정 (출석/음성용)
 # ----------------------------------------
 KST = timezone(timedelta(hours=9))
 user_voice_seconds = {}
@@ -23,38 +22,32 @@ user_voice_seconds = {}
 EXCLUDED_CHANNEL_IDS = [1498085152281067791]
 CATEGORY_ID = [1530948235563372707]
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "integrated.db")
-
 def init_attendance_db():
-    conn = sqlite3.connect(DB_PATH) 
+    # 출석/채널설정 데이터도 낚시 게임 데이터와 같은 Supabase(Postgres)에 저장합니다.
+    # Render는 재배포/재시작마다 로컬 디스크가 초기화되지만, Supabase는 별도 서버라 영향받지 않습니다.
+    conn = get_db_connection_plain()
     cursor = conn.cursor()
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS attendance_users (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             last_check TEXT,
             count INTEGER DEFAULT 0,
-            last_voice_at TEXT
+            last_voice_at TEXT,
+            sol_erda_pieces INTEGER DEFAULT 0
         )
-    """
+        """
     )
-    # 기존 설정 테이블의 제약 조건 충돌 문제를 해결하기 위해 드롭 후 재생성 (출석 데이터는 유지됨)
-    cursor.execute("DROP TABLE IF EXISTS settings;")
     cursor.execute(
         """
-        CREATE TABLE settings (
-            guild_id INTEGER PRIMARY KEY,
-            channel_id INTEGER
+        CREATE TABLE IF NOT EXISTS settings (
+            guild_id BIGINT PRIMARY KEY,
+            channel_id BIGINT
         )
-    """
+        """
     )
-    try:
-        cursor.execute("ALTER TABLE attendance_users ADD COLUMN sol_erda_pieces INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-
     conn.commit()
+    cursor.close()
     conn.close()
 
 # ----------------------------------------
@@ -86,6 +79,13 @@ def get_db_connection():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL 환경 변수가 설정되지 않았습니다. Render 대시보드를 확인하세요.")
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+def get_db_connection_plain():
+    # 출석/설정 코드는 (딕셔너리가 아닌) 튜플 형태로 행(row)을 다루므로
+    # RealDictCursor 없이 기본 커서를 쓰는 연결을 따로 둡니다.
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL 환경 변수가 설정되지 않았습니다. Render 대시보드를 확인하세요.")
+    return psycopg2.connect(DATABASE_URL)
 
 def _get_user_data_sync(user_id):
     conn = get_db_connection()
@@ -481,16 +481,17 @@ async def on_voice_state_update(member, before, after):
         return
     if before.channel is None and after.channel is not None: 
         now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection_plain()
         cursor = conn.cursor()
         cursor.execute(
             """ 
-            INSERT INTO attendance_users (user_id, last_voice_at) VALUES (?, ?)
+            INSERT INTO attendance_users (user_id, last_voice_at) VALUES (%s, %s)
             ON CONFLICT(user_id) DO UPDATE SET last_voice_at = excluded.last_voice_at
             """,
             (member.id, now_str)
         )
         conn.commit()
+        cursor.close()
         conn.close()
 
         if member.id not in user_voice_seconds:
@@ -502,7 +503,7 @@ async def check_voice_time():
     today_str = now.strftime("%Y-%m-%d")
     if now.hour == 0 and now.minute == 0:
         user_voice_seconds.clear()
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection_plain()
         cursor = conn.cursor()
         cursor.execute(
             "SELECT user_id, last_voice_at, count FROM attendance_users WHERE count > 0"
@@ -515,18 +516,19 @@ async def check_voice_time():
                 if hours_diff >= 72:
                     if count % 30 != 0:
                         cursor.execute(
-                            "UPDATE attendance_users SET count = 0 WHERE user_id = ?", (user_id,)
+                            "UPDATE attendance_users SET count = 0 WHERE user_id = %s", (user_id,)
                         )
                     elif count % 30 == 0:
                         new_count = int((count // 30) * 30)
                         cursor.execute(
-                            "UPDATE attendance_users SET count = ? WHERE user_id = ?", (new_count, user_id)
+                            "UPDATE attendance_users SET count = %s WHERE user_id = %s", (new_count, user_id)
                         )
         conn.commit()
+        cursor.close()
         conn.close()
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection_plain()
     cursor = conn.cursor()
     for guild in bot.guilds:
         for vc in guild.voice_channels:
@@ -534,7 +536,7 @@ async def check_voice_time():
                 if member.bot:
                     continue
                 cursor.execute(
-                    "SELECT last_check, count FROM attendance_users WHERE user_id = ?", (member.id,)
+                    "SELECT last_check, count FROM attendance_users WHERE user_id = %s", (member.id,)
                 )
                 row = cursor.fetchone()
                 if row and row[0] == today_str:
@@ -544,13 +546,14 @@ async def check_voice_time():
                 if current_time >= 600:  # 10분(600초) 단축
                     await process_attendance(member, today_str)
     conn.commit()
+    cursor.close()
     conn.close()
 
 async def process_attendance(member, today_str):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection_plain()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT last_check, count, COALESCE(sol_erda_pieces, 0) FROM attendance_users WHERE user_id = ?", (member.id,)
+        "SELECT last_check, count, COALESCE(sol_erda_pieces, 0) FROM attendance_users WHERE user_id = %s", (member.id,)
     )
     row = cursor.fetchone()
 
@@ -561,7 +564,7 @@ async def process_attendance(member, today_str):
         if pieces > 0:
             reward_msg = "\n🎉 **누적 출석 7일 달성!** 솔 에르다 조각 **5개**가 지급되었습니다!"
         cursor.execute(
-            "INSERT INTO attendance_users (user_id, last_check, count, sol_erda_pieces) VALUES (?, ?, ?, ?)",
+            "INSERT INTO attendance_users (user_id, last_check, count, sol_erda_pieces) VALUES (%s, %s, %s, %s)",
             (member.id, today_str, count, pieces),
         )
     else:
@@ -572,14 +575,15 @@ async def process_attendance(member, today_str):
                 pieces += 5
                 reward_msg = "\n🎉 **누적 출석 7일 달성!** 솔 에르다 조각 **5개**가 지급되었습니다!"
             cursor.execute(
-                "UPDATE attendance_users SET last_check = ?, count = ?, sol_erda_pieces = ? WHERE user_id = ?",
+                "UPDATE attendance_users SET last_check = %s, count = %s, sol_erda_pieces = %s WHERE user_id = %s",
                 (today_str, count, pieces, member.id),
             )
     conn.commit()
     cursor.execute(
-        "SELECT channel_id FROM settings WHERE guild_id = ?", (member.guild.id,)
+        "SELECT channel_id FROM settings WHERE guild_id = %s", (member.guild.id,)
     )
     channel_row = cursor.fetchone()
+    cursor.close()
     conn.close()
 
     if not channel_row or not channel_row[0]:
@@ -644,14 +648,15 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @app_commands.checks.has_permissions(administrator=True)
 async def set_attendance_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     guild_id = interaction.guild.id
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection_plain()
     cursor = conn.cursor()
     cursor.execute(
-        """INSERT INTO settings (guild_id, channel_id) VALUES (?, ?) 
+        """INSERT INTO settings (guild_id, channel_id) VALUES (%s, %s) 
            ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id""",
         (guild_id, channel.id),
     )
     conn.commit()
+    cursor.close()
     conn.close()
     await interaction.response.send_message(f"✅ 출석 채널이 {channel.mention}로 성공적으로 설정되었습니다.", ephemeral=True)
 
@@ -667,16 +672,16 @@ async def check_attendance(interaction: discord.Interaction):
     user_id = interaction.user.id
     today_str = datetime.now(KST).strftime("%Y-%m-%d")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection_plain()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT last_check, count, COALESCE(sol_erda_pieces, 0) FROM attendance_users WHERE user_id = ?", (user_id,)
+        "SELECT last_check, count, COALESCE(sol_erda_pieces, 0) FROM attendance_users WHERE user_id = %s", (user_id,)
     )
     row = cursor.fetchone()
 
     if row is None:
         cursor.execute(
-            "INSERT INTO attendance_users (user_id, last_check, count, sol_erda_pieces) VALUES (?, ?, ?, ?)",
+            "INSERT INTO attendance_users (user_id, last_check, count, sol_erda_pieces) VALUES (%s, %s, %s, %s)",
             (user_id, today_str, 0, 0),
         )
         conn.commit()
@@ -685,6 +690,7 @@ async def check_attendance(interaction: discord.Interaction):
     else:
         last_check, count, pieces = row
 
+    cursor.close()
     conn.close()
 
     remainder = count % 7
@@ -712,19 +718,20 @@ async def check_attendance(interaction: discord.Interaction):
 @app_commands.checks.has_permissions(administrator=True)
 async def attendance_admin(interaction: discord.Interaction, action: str, user: discord.Member, amount: int):
     if action == "조각수정":
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection_plain()
         cursor = conn.cursor()
         
-        cursor.execute("SELECT user_id FROM attendance_users WHERE user_id = ?", (user.id,))
+        cursor.execute("SELECT user_id FROM attendance_users WHERE user_id = %s", (user.id,))
         row = cursor.fetchone()
         
         if row:
-            cursor.execute("UPDATE attendance_users SET sol_erda_pieces = ? WHERE user_id = ?", (amount, user.id))
+            cursor.execute("UPDATE attendance_users SET sol_erda_pieces = %s WHERE user_id = %s", (amount, user.id))
         else:
             today_str = datetime.now(KST).strftime("%Y-%m-%d")
-            cursor.execute("INSERT INTO attendance_users (user_id, last_check, count, sol_erda_pieces) VALUES (?, ?, 0, ?)", (user.id, today_str, amount))
+            cursor.execute("INSERT INTO attendance_users (user_id, last_check, count, sol_erda_pieces) VALUES (%s, %s, 0, %s)", (user.id, today_str, amount))
             
         conn.commit()
+        cursor.close()
         conn.close()
 
         await interaction.response.send_message(f"✅ {user.mention}님의 솔 에르다 조각 개수가 **{amount}개**로 수정되었습니다.", ephemeral=True)
