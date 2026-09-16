@@ -20,7 +20,7 @@ KST = timezone(timedelta(hours=9))
 user_voice_seconds = {}
 
 EXCLUDED_CHANNEL_IDS = [1498085152281067791]
-CATEGORY_ID = [1530948235563372707]
+CATEGORY_ID = [1534250108475150438]
 
 def init_attendance_db():
     # 출석/채널설정 데이터도 낚시 게임 데이터와 같은 Supabase(Postgres)에 저장합니다.
