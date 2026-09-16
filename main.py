@@ -168,6 +168,7 @@ intents.guilds = True
 intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+bot.persistent_views_added = False
 
 EXP_EVENT_MULTIPLIER = 1
 MESO_EVENT_MULTIPLIER = 1
@@ -388,71 +389,165 @@ class SaleModal(discord.ui.Modal, title="판매글 등록"):
         embed.add_field(name="", value=sale_amount + "억 메소를 억당" + sale_price + "원으로 판매합니다", inline=False)
         embed.add_field(name="", value=sale_comment if sale_comment else "", inline=False)
         embed.set_footer(text="구매를 누르면 바로 채널이 생성되니 주의해주세요!")
-        main_view = buybutton(seller=seller)
-        other_view = Saleview(seller=seller)
-        for child in other_view.children:
-            main_view.add_item(child)
 
+        main_view = build_sale_post_view(seller)
         await interaction.response.send_message(embed=embed, view=main_view, ephemeral=False)
-
-class tradeoverview(discord.ui.View):
-    def __init__(self, seller: discord.User | discord.Member, original_message: discord.Message):
-        super().__init__(timeout=None)
-        self.seller = seller
-        self.original_message = original_message
-
-    @discord.ui.button(label="거래 끝내기", style=discord.ButtonStyle.red)
-    async def end_trade(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user == self.seller:
-            end_embed = discord.Embed(title="판매 완료", description="거래가 종료된 게시글입니다.", color=discord.Color.yellow())
-            await self.original_message.edit(embed=end_embed, view=Saleview(seller=self.seller))
-            await interaction.response.send_message("거래를 종료합니다. 1분 뒤 채널이 삭제 됩니다.", ephemeral=True)
-            await asyncio.sleep(60)
-            await interaction.channel.delete()
-        else:
-            await interaction.response.send_message("거래를 종료할 권한이 없습니다.", ephemeral=True)
-            return
 
 class Saleview(discord.ui.View):
     def __init__(self, seller: discord.User | discord.Member):
         super().__init__(timeout=None)
         self.seller = seller
 
-    @discord.ui.button(label="나도 등록하기", style=discord.ButtonStyle.green, emoji="📝")
+    @discord.ui.button(label="나도 등록하기", style=discord.ButtonStyle.green, emoji="📝", custom_id="sale_register_button")
     async def register_sale(self, interaction: discord.Interaction, button: discord.ui.Button):
         modal = SaleModal()
         await interaction.response.send_modal(modal)
 
-class buybutton(discord.ui.View):
-    def __init__(self, seller: discord.User | discord.Member):
-        super().__init__(timeout=None)
-        self.seller = seller
+# ------------------------------------------
+# 재배포/재시작에도 살아남는 "구매" / "거래 끝내기" 버튼
+#
+# 이 두 버튼은 메시지마다 판매자(seller)가 다르기 때문에, 그 정보를
+# custom_id 안에 함께 저장해둡니다 (예: "buy_button:123456789").
+# 그래서 봇이 재시작되어 예전 View 객체가 사라져도, custom_id만 보고
+# on_interaction에서 누가 판매자였는지 다시 알아낼 수 있습니다.
+# 버튼 자체의 콜백은 아무 것도 하지 않는 빈 함수이고, 실제 처리는
+# 전부 아래쪽의 on_interaction 핸들러 하나에서 담당합니다.
+# ------------------------------------------
+async def _noop_button_callback(interaction: discord.Interaction):
+    pass  # 실제 동작은 on_interaction에서 처리합니다.
 
-    @discord.ui.button(label="구매", style=discord.ButtonStyle.green)
-    async def buy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        buyer = interaction.user
-        guild = interaction.guild
-        if buyer == self.seller:
-            await interaction.response.send_message("자신의 구매글은 구매할 수 없습니다.", ephemeral=True)
+def build_sale_post_view(seller: discord.User | discord.Member) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+
+    buy_button = discord.ui.Button(
+        label="구매",
+        style=discord.ButtonStyle.green,
+        custom_id=f"buy_button:{seller.id}",
+    )
+    buy_button.callback = _noop_button_callback
+    view.add_item(buy_button)
+
+    register_button = discord.ui.Button(
+        label="나도 등록하기",
+        style=discord.ButtonStyle.green,
+        emoji="📝",
+        custom_id="sale_register_button",
+    )
+    async def _register_callback(interaction: discord.Interaction):
+        modal = SaleModal()
+        await interaction.response.send_modal(modal)
+    register_button.callback = _register_callback
+    view.add_item(register_button)
+
+    return view
+
+def build_trade_control_view(seller_id: int, original_channel_id: int, original_message_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+
+    end_trade_button = discord.ui.Button(
+        label="거래 끝내기",
+        style=discord.ButtonStyle.red,
+        custom_id=f"end_trade:{seller_id}:{original_channel_id}:{original_message_id}",
+    )
+    end_trade_button.callback = _noop_button_callback
+    view.add_item(end_trade_button)
+
+    return view
+
+async def handle_buy_button(interaction: discord.Interaction, seller_id: int):
+    buyer = interaction.user
+    guild = interaction.guild
+
+    if buyer.id == seller_id:
+        await interaction.response.send_message("자신의 구매글은 구매할 수 없습니다.", ephemeral=True)
+        return
+
+    seller = guild.get_member(seller_id)
+    if seller is None:
+        try:
+            seller = await guild.fetch_member(seller_id)
+        except discord.NotFound:
+            await interaction.response.send_message(
+                "판매자 정보를 찾을 수 없습니다. (서버에서 나갔을 수 있어요)", ephemeral=True
+            )
             return
-        category = interaction.guild.get_channel(CATEGORY_ID[0])
-        await interaction.response.defer(ephemeral=True)
-        original_message = interaction.message
-        trading_message = discord.Embed(title="거래중...", description="현재 거래가 진행 중인 게시글 입니다.")
-        await original_message.edit(embed=trading_message, view=Saleview(seller=self.seller))
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            self.seller: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
-            buyer: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
-            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
-        }
-        channel_name = f"{interaction.user.name}님의 구매문의"
-        new_channel = await interaction.guild.create_text_channel(name=channel_name, overwrites=overwrites, category=category)
-        embed = discord.Embed(title="메소 구매 문의", description=f"{self.seller.mention}님과 {buyer.mention}님의 구매 문의 채널입니다.", color=discord.Color.green())
-        view = tradeoverview(seller=self.seller, original_message=original_message)
-        await new_channel.send(embed=embed, view=view)
-        await new_channel.send(f"{self.seller.mention}{buyer.mention}")
-        await interaction.followup.send(f"{new_channel.mention} 채널이 생성되었습니다.", ephemeral=True)
+
+    category = guild.get_channel(CATEGORY_ID[0])
+    await interaction.response.defer(ephemeral=True)
+
+    original_message = interaction.message
+    trading_message = discord.Embed(title="거래중...", description="현재 거래가 진행 중인 게시글 입니다.")
+    await original_message.edit(embed=trading_message, view=Saleview(seller=seller))
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        seller: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
+        buyer: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
+        guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
+    }
+    channel_name = f"{buyer.name}님의 구매문의"
+    new_channel = await guild.create_text_channel(name=channel_name, overwrites=overwrites, category=category)
+
+    embed = discord.Embed(
+        title="메소 구매 문의",
+        description=f"{seller.mention}님과 {buyer.mention}님의 구매 문의 채널입니다.",
+        color=discord.Color.green(),
+    )
+    view = build_trade_control_view(seller.id, original_message.channel.id, original_message.id)
+    await new_channel.send(embed=embed, view=view)
+    await new_channel.send(f"{seller.mention}{buyer.mention}")
+    await interaction.followup.send(f"{new_channel.mention} 채널이 생성되었습니다.", ephemeral=True)
+
+async def handle_end_trade_button(interaction: discord.Interaction, seller_id: int, original_channel_id: int, original_message_id: int):
+    if interaction.user.id != seller_id:
+        await interaction.response.send_message("거래를 종료할 권한이 없습니다.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("거래를 종료합니다. 1분 뒤 채널이 삭제 됩니다.", ephemeral=True)
+
+    try:
+        original_channel = interaction.guild.get_channel(original_channel_id)
+        if original_channel is None:
+            original_channel = await bot.fetch_channel(original_channel_id)
+        original_message = await original_channel.fetch_message(original_message_id)
+
+        seller = interaction.guild.get_member(seller_id) or interaction.user
+        end_embed = discord.Embed(title="판매 완료", description="거래가 종료된 게시글입니다.", color=discord.Color.yellow())
+        await original_message.edit(embed=end_embed, view=Saleview(seller=seller))
+    except Exception as e:
+        print(f"거래 종료 처리 중 원본 게시글 갱신 실패: {e}")
+
+    await asyncio.sleep(60)
+    try:
+        await interaction.channel.delete()
+    except Exception as e:
+        print(f"거래 채널 삭제 실패: {e}")
+
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    if interaction.type != discord.InteractionType.component:
+        return
+
+    custom_id = interaction.data.get("custom_id", "") if interaction.data else ""
+
+    if custom_id.startswith("buy_button:"):
+        try:
+            seller_id = int(custom_id.split(":", 1)[1])
+        except (IndexError, ValueError):
+            return
+        await handle_buy_button(interaction, seller_id)
+
+    elif custom_id.startswith("end_trade:"):
+        parts = custom_id.split(":")
+        if len(parts) != 4:
+            return
+        try:
+            seller_id = int(parts[1])
+            original_channel_id = int(parts[2])
+            original_message_id = int(parts[3])
+        except ValueError:
+            return
+        await handle_end_trade_button(interaction, seller_id, original_channel_id, original_message_id)
 
 # ------------------------------------------
 # 이벤트 및 백그라운드 태스크
@@ -462,6 +557,13 @@ async def on_ready():
     init_attendance_db()
     if not check_voice_time.is_running():
         check_voice_time.start()
+
+    # "나도 등록하기" 버튼이 재배포 후에도 계속 작동하도록 다시 등록합니다.
+    # (custom_id가 고정되어 있어야 하고, 이 등록은 봇 프로세스당 한 번만 하면 됩니다)
+    if not bot.persistent_views_added:
+        bot.add_view(Saleview(seller=None))
+        bot.persistent_views_added = True
+
     print(f'로그인 성공: {bot.user.name}')
     try:
         MY_GUILD = discord.Object(id=1498077956839313559)
@@ -802,7 +904,10 @@ async def attendance_admin(interaction: discord.Interaction, action: str, user: 
 
 USER_COOLDOWNS = {}
 
-@bot.tree.command(name="포춘쿠키", description="오늘의 행운의 포춘쿠키를 뽑고 행복한 문구를 확인합니다. (하루 3회)")
+DAILY_FORTUNE_LIMIT = 1
+FORTUNE_PIECE_CHANCE = 15  # %
+
+@bot.tree.command(name="포춘쿠키", description="오늘의 행운의 포춘쿠키를 뽑고 행복한 문구를 확인합니다. (하루 1회)")
 async def fortune_cookie(interaction: discord.Interaction):
     user_id = interaction.user.id
     today_str = datetime.now(KST).strftime("%Y-%m-%d")
@@ -824,18 +929,18 @@ async def fortune_cookie(interaction: discord.Interaction):
     if fortune_date != today_str:
         fortune_count = 0
 
-    if fortune_count >= 3:
+    if fortune_count >= DAILY_FORTUNE_LIMIT:
         cursor.close()
         conn.close()
         await interaction.response.send_message(
-            "🥠 오늘 포춘쿠키는 이미 **3번** 모두 뽑으셨어요! 내일 다시 찾아와주세요. 🌙",
+            f"🥠 오늘 포춘쿠키는 이미 **{DAILY_FORTUNE_LIMIT}번** 모두 뽑으셨어요! 내일 다시 찾아와주세요. 🌙",
             ephemeral=True
         )
         return
 
     fortune_count += 1
 
-    gained_piece = random.randint(1, 100) <= 5  # 5% 확률
+    gained_piece = random.randint(1, 100) <= FORTUNE_PIECE_CHANCE
     if gained_piece:
         pieces += 1
 
@@ -865,7 +970,7 @@ async def fortune_cookie(interaction: discord.Interaction):
     if gained_piece:
         embed.add_field(name="🎉 깜짝 선물!", value="포춘쿠키 속에서 **솔 에르다 조각 1개**를 발견했습니다!", inline=False)
     embed.add_field(name="💎 보유 솔 에르다 조각", value=f"{pieces:,}개", inline=True)
-    embed.add_field(name="🥠 오늘 남은 횟수", value=f"{3 - fortune_count}/3회", inline=True)
+    embed.add_field(name="🥠 오늘 남은 횟수", value=f"{DAILY_FORTUNE_LIMIT - fortune_count}/{DAILY_FORTUNE_LIMIT}회", inline=True)
     embed.set_footer(text=f"요청자: {interaction.user.display_name}", icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
     await interaction.response.send_message(embed=embed)
 
