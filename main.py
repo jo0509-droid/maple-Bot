@@ -472,12 +472,31 @@ async def handle_buy_button(interaction: discord.Interaction, seller_id: int):
             )
             return
 
-    category = guild.get_channel(CATEGORY_ID[0])
     await interaction.response.defer(ephemeral=True)
 
     original_message = interaction.message
-    trading_message = discord.Embed(title="거래중...", description="현재 거래가 진행 중인 게시글 입니다.")
-    await original_message.edit(embed=trading_message, view=Saleview(seller=seller))
+    category = guild.get_channel(CATEGORY_ID[0])
+    if category is None:
+        try:
+            category = await bot.fetch_channel(CATEGORY_ID[0])
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+            print(f"거래 카테고리 조회 실패 (ID: {CATEGORY_ID[0]}): {error}")
+
+    if not isinstance(category, discord.CategoryChannel):
+        print(f"거래 카테고리를 찾을 수 없거나 카테고리 채널이 아닙니다: {CATEGORY_ID[0]}")
+        await interaction.followup.send(
+            "거래 채널을 만들 카테고리를 찾을 수 없습니다. 관리자에게 카테고리 ID를 확인해달라고 알려주세요.",
+            ephemeral=True,
+        )
+        return
+
+    bot_member = guild.me
+    if bot_member is None or not bot_member.guild_permissions.manage_channels:
+        await interaction.followup.send(
+            "봇에 채널 관리 권한이 없어 거래 채널을 만들 수 없습니다.",
+            ephemeral=True,
+        )
+        return
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(read_messages=False),
@@ -486,7 +505,18 @@ async def handle_buy_button(interaction: discord.Interaction, seller_id: int):
         guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
     }
     channel_name = f"{buyer.name}님의 구매문의"
-    new_channel = await guild.create_text_channel(name=channel_name, overwrites=overwrites, category=category)
+    try:
+        new_channel = await guild.create_text_channel(name=channel_name, overwrites=overwrites, category=category)
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"거래 채널 생성 실패 (카테고리 ID: {category.id}): {error}")
+        await interaction.followup.send(
+            "거래 채널을 만들지 못했습니다. 봇의 채널 관리 권한과 카테고리 설정을 확인해주세요.",
+            ephemeral=True,
+        )
+        return
+
+    trading_message = discord.Embed(title="거래중...", description="현재 거래가 진행 중인 게시글 입니다.")
+    await original_message.edit(embed=trading_message, view=Saleview(seller=seller))
 
     embed = discord.Embed(
         title="메소 구매 문의",
