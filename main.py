@@ -935,7 +935,7 @@ async def attendance_admin(interaction: discord.Interaction, action: str, user: 
 USER_COOLDOWNS = {}
 
 DAILY_FORTUNE_LIMIT = 1
-FORTUNE_PIECE_CHANCE = 15  # %
+FORTUNE_PIECE_CHANCE = 25  # %
 
 @bot.tree.command(name="포춘쿠키", description="오늘의 행운의 포춘쿠키를 뽑고 행복한 문구를 확인합니다. (하루 1회)")
 async def fortune_cookie(interaction: discord.Interaction):
