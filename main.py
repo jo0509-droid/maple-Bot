@@ -310,7 +310,7 @@ FORTUNES = [
 
 SPOTS = {
     "리스항구": {
-        "req_lvl": 1, "fail_chance": 10, "cooldown": 10, "chest_chance": 0.2,
+        "req_lvl": 1, "fail_chance": 10, "cooldown": 10, "chest_chance": 0.0,
         "fishes": [
             {"name": "👟 날아간 고무신", "exp": 30, "min_meso": 1, "max_meso": 6, "chance": 40},
             {"name": "🐟 리스항구 피라미", "exp": 80, "min_meso": 3, "max_meso": 8, "chance": 35},
@@ -319,7 +319,7 @@ SPOTS = {
         ]
     },
     "노틸러스": {
-        "req_lvl": 201, "fail_chance": 15, "cooldown": 20, "chest_chance": 0.4,
+        "req_lvl": 201, "fail_chance": 15, "cooldown": 20, "chest_chance": 0.2,
         "fishes": [
             {"name": "🧹 선장의 청소자루", "exp": 200, "min_meso": 9, "max_meso": 12, "chance": 40},
             {"name": "🐠 해적선 날치", "exp": 450, "min_meso": 13, "max_meso": 16, "chance": 35},
@@ -328,7 +328,7 @@ SPOTS = {
         ]
     },
     "아쿠아리움": {
-        "req_lvl": 501, "fail_chance": 20, "cooldown": 30, "chest_chance": 0.6,
+        "req_lvl": 501, "fail_chance": 20, "cooldown": 30, "chest_chance": 0.4,
         "fishes": [
             {"name": "🌿 바다이끼 뭉치", "exp": 600, "min_meso": 26, "max_meso": 30, "chance": 40},
             {"name": "🐡 망둥어", "exp": 1300, "min_meso": 31, "max_meso": 35, "chance": 35},
@@ -337,7 +337,7 @@ SPOTS = {
         ]
     },
     "에스페라": {
-        "req_lvl": 601, "fail_chance": 25, "cooldown": 40, "chest_chance": 0.8,
+        "req_lvl": 601, "fail_chance": 25, "cooldown": 40, "chest_chance": 0.6,
         "fishes": [
             {"name": "💧 시작의 바다 결정", "exp": 1500, "min_meso": 51, "max_meso": 60, "chance": 40},
             {"name": "🪼 아르카나 집게벌레", "exp": 3500, "min_meso": 61, "max_meso": 70, "chance": 35},
@@ -346,7 +346,7 @@ SPOTS = {
         ]
     },
     "셀라스": {
-        "req_lvl": 801, "fail_chance": 30, "cooldown": 50, "chest_chance": 1.0,
+        "req_lvl": 801, "fail_chance": 30, "cooldown": 50, "chest_chance": 0.8,
         "fishes": [
             {"name": "🪸 별빛 심해 해초", "exp": 3000, "min_meso": 101, "max_meso": 120, "chance": 40},
             {"name": "🦑 잠기는 심해 오징어", "exp": 7000, "min_meso": 121, "max_meso": 140, "chance": 35},
@@ -355,7 +355,7 @@ SPOTS = {
         ]
     },
     "검은바다": {
-        "req_lvl": 1000, "fail_chance": 35, "cooldown": 60, "chest_chance": 1.2,
+        "req_lvl": 1000, "fail_chance": 35, "cooldown": 60, "chest_chance": 1.0,
         "fishes": [
             {"name": "🍷 찬란한 연회의 파편", "exp": 6000, "min_meso": 201, "max_meso": 250, "chance": 40},
             {"name": "🕯️ 칠흑의 촛대 조각", "exp": 14000, "min_meso": 251, "max_meso": 300, "chance": 35},
@@ -1026,8 +1026,21 @@ async def fortune_cookie(interaction: discord.Interaction):
     embed.set_footer(text=f"요청자: {interaction.user.display_name}", icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="더도말고덜도말고한가위만같아라", description="더도 말고 덜도 말고 한가위만 같아라! (1% 확률로 리스트레인트 링 1개 획득, 추석 한정 이벤트)")
+chuseok_last_used = {}  # user_id -> 마지막으로 사용한 날짜 문자열 (봇 메모리에만 저장, 재배포 시 초기화됨)
+
+@bot.tree.command(name="더도말고덜도말고한가위만같아라", description="더도 말고 덜도 말고 한가위만 같아라! (1일 1회, 1% 확률로 리스트레인트 링 1개 획득, 추석 한정 이벤트)")
 async def chuseok_greeting(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    today_str = datetime.now(KST).strftime("%Y-%m-%d")
+
+    if chuseok_last_used.get(user_id) == today_str:
+        await interaction.response.send_message(
+            "🌕 오늘은 이미 사용하셨어요! 내일 다시 찾아와주세요.", ephemeral=True
+        )
+        return
+
+    chuseok_last_used[user_id] = today_str
+
     gained = random.randint(1, 100) <= 1  # 1% 확률
 
     embed = discord.Embed(
