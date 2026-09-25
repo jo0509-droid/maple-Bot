@@ -20,7 +20,9 @@ KST = timezone(timedelta(hours=9))
 user_voice_seconds = {}
 
 EXCLUDED_CHANNEL_IDS = [1498085152281067791]
-CATEGORY_ID = [1534250108475150438]
+CATEGORY_ID = [1530948235563372707]
+
+MAX_SOL_ERDA_PIECES = 30  # 출석/포춘쿠키로 자연스럽게 쌓을 수 있는 솔 에르다 조각 최대치
 
 def init_attendance_db():
     # 출석/채널설정 데이터도 낚시 게임 데이터와 같은 Supabase(Postgres)에 저장합니다.
@@ -374,6 +376,27 @@ def get_max_exp(level):
 # ------------------------------------------
 # UI 클래스들
 # ------------------------------------------
+# ------------------------------------------
+# 판매/거래 관련 View들이 공통으로 쓰는 기본 클래스입니다.
+# 버튼 콜백 안에서 예외가 나면 기본적으로는 조용히 무시되고
+# 디스코드에는 "적시에 응답하지 않았어요"만 뜨는데, 그러면 원인을
+# 알 방법이 없어서 여기서 에러를 잡아 화면에 직접 보여주고 로그에도 남깁니다.
+# ------------------------------------------
+class ErrorReportingView(discord.ui.View):
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        import traceback
+        print(f"[판매/거래 View 오류] item={item!r} error={error!r}")
+        traceback.print_exc()
+
+        msg = f"❌ 버튼 처리 중 오류가 발생했습니다: `{error}`"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
+
 class SaleModal(discord.ui.Modal, title="판매글 등록"):
     sale_amount = discord.ui.TextInput(label="판매 수량을 입력해주세요", placeholder="10억 메소는 10", required=True)
     sale_price = discord.ui.TextInput(label="1억당 가격을 입력해주세요", placeholder="1600원은 1600, 1500원은 1500으로 입력해주세요", required=True)
@@ -393,7 +416,20 @@ class SaleModal(discord.ui.Modal, title="판매글 등록"):
         main_view = build_sale_post_view(seller)
         await interaction.response.send_message(embed=embed, view=main_view, ephemeral=False)
 
-class Saleview(discord.ui.View):
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        import traceback
+        print(f"[판매글 등록 모달 오류] error={error!r}")
+        traceback.print_exc()
+        msg = f"❌ 판매글 등록 중 오류가 발생했습니다: `{error}`"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
+
+class Saleview(ErrorReportingView):
     def __init__(self, seller: discord.User | discord.Member):
         super().__init__(timeout=None)
         self.seller = seller
@@ -417,7 +453,7 @@ async def _noop_button_callback(interaction: discord.Interaction):
     pass  # 실제 동작은 on_interaction에서 처리합니다.
 
 def build_sale_post_view(seller: discord.User | discord.Member) -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
+    view = ErrorReportingView(timeout=None)
 
     buy_button = discord.ui.Button(
         label="구매",
@@ -442,7 +478,7 @@ def build_sale_post_view(seller: discord.User | discord.Member) -> discord.ui.Vi
     return view
 
 def build_trade_control_view(seller_id: int, original_channel_id: int, original_message_id: int) -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
+    view = ErrorReportingView(timeout=None)
 
     end_trade_button = discord.ui.Button(
         label="거래 끝내기",
@@ -472,31 +508,12 @@ async def handle_buy_button(interaction: discord.Interaction, seller_id: int):
             )
             return
 
+    category = guild.get_channel(CATEGORY_ID[0])
     await interaction.response.defer(ephemeral=True)
 
     original_message = interaction.message
-    category = guild.get_channel(CATEGORY_ID[0])
-    if category is None:
-        try:
-            category = await bot.fetch_channel(CATEGORY_ID[0])
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
-            print(f"거래 카테고리 조회 실패 (ID: {CATEGORY_ID[0]}): {error}")
-
-    if not isinstance(category, discord.CategoryChannel):
-        print(f"거래 카테고리를 찾을 수 없거나 카테고리 채널이 아닙니다: {CATEGORY_ID[0]}")
-        await interaction.followup.send(
-            "거래 채널을 만들 카테고리를 찾을 수 없습니다. 관리자에게 카테고리 ID를 확인해달라고 알려주세요.",
-            ephemeral=True,
-        )
-        return
-
-    bot_member = guild.me
-    if bot_member is None or not bot_member.guild_permissions.manage_channels:
-        await interaction.followup.send(
-            "봇에 채널 관리 권한이 없어 거래 채널을 만들 수 없습니다.",
-            ephemeral=True,
-        )
-        return
+    trading_message = discord.Embed(title="거래중...", description="현재 거래가 진행 중인 게시글 입니다.")
+    await original_message.edit(embed=trading_message, view=Saleview(seller=seller))
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(read_messages=False),
@@ -505,18 +522,7 @@ async def handle_buy_button(interaction: discord.Interaction, seller_id: int):
         guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
     }
     channel_name = f"{buyer.name}님의 구매문의"
-    try:
-        new_channel = await guild.create_text_channel(name=channel_name, overwrites=overwrites, category=category)
-    except (discord.Forbidden, discord.HTTPException) as error:
-        print(f"거래 채널 생성 실패 (카테고리 ID: {category.id}): {error}")
-        await interaction.followup.send(
-            "거래 채널을 만들지 못했습니다. 봇의 채널 관리 권한과 카테고리 설정을 확인해주세요.",
-            ephemeral=True,
-        )
-        return
-
-    trading_message = discord.Embed(title="거래중...", description="현재 거래가 진행 중인 게시글 입니다.")
-    await original_message.edit(embed=trading_message, view=Saleview(seller=seller))
+    new_channel = await guild.create_text_channel(name=channel_name, overwrites=overwrites, category=category)
 
     embed = discord.Embed(
         title="메소 구매 문의",
@@ -560,24 +566,37 @@ async def on_interaction(interaction: discord.Interaction):
 
     custom_id = interaction.data.get("custom_id", "") if interaction.data else ""
 
-    if custom_id.startswith("buy_button:"):
-        try:
-            seller_id = int(custom_id.split(":", 1)[1])
-        except (IndexError, ValueError):
-            return
-        await handle_buy_button(interaction, seller_id)
+    try:
+        if custom_id.startswith("buy_button:"):
+            try:
+                seller_id = int(custom_id.split(":", 1)[1])
+            except (IndexError, ValueError):
+                return
+            await handle_buy_button(interaction, seller_id)
 
-    elif custom_id.startswith("end_trade:"):
-        parts = custom_id.split(":")
-        if len(parts) != 4:
-            return
+        elif custom_id.startswith("end_trade:"):
+            parts = custom_id.split(":")
+            if len(parts) != 4:
+                return
+            try:
+                seller_id = int(parts[1])
+                original_channel_id = int(parts[2])
+                original_message_id = int(parts[3])
+            except ValueError:
+                return
+            await handle_end_trade_button(interaction, seller_id, original_channel_id, original_message_id)
+    except Exception as e:
+        import traceback
+        print(f"[구매/거래끝내기 처리 오류] custom_id={custom_id} error={e!r}")
+        traceback.print_exc()
+        msg = f"❌ 처리 중 오류가 발생했습니다: `{e}`"
         try:
-            seller_id = int(parts[1])
-            original_channel_id = int(parts[2])
-            original_message_id = int(parts[3])
-        except ValueError:
-            return
-        await handle_end_trade_button(interaction, seller_id, original_channel_id, original_message_id)
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
 
 # ------------------------------------------
 # 이벤트 및 백그라운드 태스크
@@ -698,6 +717,7 @@ async def process_attendance(member, today_str):
     if row is None:
         count = 1
         pieces = 5 if count % 7 == 0 else 0
+        pieces = min(pieces, MAX_SOL_ERDA_PIECES)
         if pieces > 0:
             reward_msg = "\n🎉 **누적 출석 7일 달성!** 솔 에르다 조각 **5개**가 지급되었습니다!"
         cursor.execute(
@@ -708,8 +728,8 @@ async def process_attendance(member, today_str):
         last_check, count, pieces = row
         if last_check != today_str:
             count += 1
-            if count % 7 == 0:
-                pieces += 5
+            if count % 7 == 0 and pieces < MAX_SOL_ERDA_PIECES:
+                pieces = min(pieces + 5, MAX_SOL_ERDA_PIECES)
                 reward_msg = "\n🎉 **누적 출석 7일 달성!** 솔 에르다 조각 **5개**가 지급되었습니다!"
             cursor.execute(
                 "UPDATE attendance_users SET last_check = %s, count = %s, sol_erda_pieces = %s WHERE user_id = %s",
@@ -935,7 +955,7 @@ async def attendance_admin(interaction: discord.Interaction, action: str, user: 
 USER_COOLDOWNS = {}
 
 DAILY_FORTUNE_LIMIT = 1
-FORTUNE_PIECE_CHANCE = 25  # %
+FORTUNE_PIECE_CHANCE = 20  # %
 
 @bot.tree.command(name="포춘쿠키", description="오늘의 행운의 포춘쿠키를 뽑고 행복한 문구를 확인합니다. (하루 1회)")
 async def fortune_cookie(interaction: discord.Interaction):
@@ -970,9 +990,9 @@ async def fortune_cookie(interaction: discord.Interaction):
 
     fortune_count += 1
 
-    gained_piece = random.randint(1, 100) <= FORTUNE_PIECE_CHANCE
+    gained_piece = random.randint(1, 100) <= FORTUNE_PIECE_CHANCE and pieces < MAX_SOL_ERDA_PIECES
     if gained_piece:
-        pieces += 1
+        pieces = min(pieces + 1, MAX_SOL_ERDA_PIECES)
 
     if row is None:
         cursor.execute(
@@ -999,8 +1019,30 @@ async def fortune_cookie(interaction: discord.Interaction):
     )
     if gained_piece:
         embed.add_field(name="🎉 깜짝 선물!", value="포춘쿠키 속에서 **솔 에르다 조각 1개**를 발견했습니다!", inline=False)
+    elif pieces >= MAX_SOL_ERDA_PIECES:
+        embed.add_field(name="💎 보유 한도 도달", value=f"솔 에르다 조각은 최대 **{MAX_SOL_ERDA_PIECES}개**까지만 쌓을 수 있어요.", inline=False)
     embed.add_field(name="💎 보유 솔 에르다 조각", value=f"{pieces:,}개", inline=True)
     embed.add_field(name="🥠 오늘 남은 횟수", value=f"{DAILY_FORTUNE_LIMIT - fortune_count}/{DAILY_FORTUNE_LIMIT}회", inline=True)
+    embed.set_footer(text=f"요청자: {interaction.user.display_name}", icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="더도말고덜도말고한가위만같아라", description="더도 말고 덜도 말고 한가위만 같아라! (1% 확률로 리스트레인트 링 1개 획득, 추석 한정 이벤트)")
+async def chuseok_greeting(interaction: discord.Interaction):
+    gained = random.randint(1, 100) <= 1  # 1% 확률
+
+    embed = discord.Embed(
+        title="🌕 더도 말고 덜도 말고 한가위만 같아라",
+        description="풍성한 한가위 보내세요! 🌕🍂",
+        color=0xE67E22
+    )
+    if gained:
+        embed.add_field(
+            name="🎉 축하합니다!",
+            value="**리스트레인트 링 1개**에 당첨되었습니다!\n스크린샷을 찍어 운영진에게 문의해주세요.",
+            inline=False
+        )
+    else:
+        embed.add_field(name="😅 아쉬워요", value="이번엔 당첨되지 않았어요. 좋은 한가위 보내세요!", inline=False)
     embed.set_footer(text=f"요청자: {interaction.user.display_name}", icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
     await interaction.response.send_message(embed=embed)
 
