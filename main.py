@@ -20,7 +20,7 @@ KST = timezone(timedelta(hours=9))
 user_voice_seconds = {}
 
 EXCLUDED_CHANNEL_IDS = [1498085152281067791]
-CATEGORY_ID = [1530948235563372707]
+CATEGORY_ID = [1534250108475150438]  # 암시장 카테고리
 
 MAX_SOL_ERDA_PIECES = 30  # 출석/포춘쿠키로 자연스럽게 쌓을 수 있는 솔 에르다 조각 최대치
 
