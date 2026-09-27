@@ -509,30 +509,45 @@ async def handle_buy_button(interaction: discord.Interaction, seller_id: int):
             return
 
     category = guild.get_channel(CATEGORY_ID[0])
+    if not isinstance(category, discord.CategoryChannel):
+        # 지정된 ID가 더 이상 카테고리가 아니거나(삭제/변경됨) 존재하지 않으면
+        # 그냥 카테고리 없이 채널을 생성합니다 (여기서 오류를 내지 않음).
+        category = None
+
     await interaction.response.defer(ephemeral=True)
 
     original_message = interaction.message
+    original_embed = original_message.embeds[0] if original_message.embeds else None
     trading_message = discord.Embed(title="거래중...", description="현재 거래가 진행 중인 게시글 입니다.")
     await original_message.edit(embed=trading_message, view=Saleview(seller=seller))
 
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(read_messages=False),
-        seller: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
-        buyer: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
-        guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
-    }
-    channel_name = f"{buyer.name}님의 구매문의"
-    new_channel = await guild.create_text_channel(name=channel_name, overwrites=overwrites, category=category)
+    try:
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            seller: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
+            buyer: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
+        }
+        channel_name = f"{buyer.name}님의 구매문의"
+        new_channel = await guild.create_text_channel(name=channel_name, overwrites=overwrites, category=category)
 
-    embed = discord.Embed(
-        title="메소 구매 문의",
-        description=f"{seller.mention}님과 {buyer.mention}님의 구매 문의 채널입니다.",
-        color=discord.Color.green(),
-    )
-    view = build_trade_control_view(seller.id, original_message.channel.id, original_message.id)
-    await new_channel.send(embed=embed, view=view)
-    await new_channel.send(f"{seller.mention}{buyer.mention}")
-    await interaction.followup.send(f"{new_channel.mention} 채널이 생성되었습니다.", ephemeral=True)
+        embed = discord.Embed(
+            title="메소 구매 문의",
+            description=f"{seller.mention}님과 {buyer.mention}님의 구매 문의 채널입니다.",
+            color=discord.Color.green(),
+        )
+        view = build_trade_control_view(seller.id, original_message.channel.id, original_message.id)
+        await new_channel.send(embed=embed, view=view)
+        await new_channel.send(f"{seller.mention}{buyer.mention}")
+        await interaction.followup.send(f"{new_channel.mention} 채널이 생성되었습니다.", ephemeral=True)
+    except Exception:
+        # 채널 생성 중 뭔가 실패하면, 판매글이 "거래중"에 갇히지 않도록 원래 상태로 되돌립니다.
+        try:
+            restore_embed = original_embed if original_embed else discord.Embed(title="메소 팔아요", color=discord.Color.green())
+            await original_message.edit(embed=restore_embed, view=build_sale_post_view(seller))
+        except Exception:
+            pass
+        raise
 
 async def handle_end_trade_button(interaction: discord.Interaction, seller_id: int, original_channel_id: int, original_message_id: int):
     if interaction.user.id != seller_id:
