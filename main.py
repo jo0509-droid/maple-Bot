@@ -539,7 +539,8 @@ ACTIVITY_RATES = {
 ACTIVITY_BASE_EXP = 1000
 ACTIVITY_EXP_STEP = 500
 
-# user_id -> 아직 지급 안 된 경험치 조각 (1/6 EXP 단위의 정수라서 소수점 오차가 없습니다)
+# user_id -> [현재 방의 6분당 EXP, 지금까지 채운 분(0~5)]
+# 6분을 꽉 채워야만 지급되고, 음성방을 나가거나 EXP 등급이 다른 방으로 옮기면 처음부터 다시 시작합니다.
 voice_exp_pending = {}
 
 def activity_exp_required(level: int) -> int:
@@ -573,8 +574,16 @@ def log_activity_voice_setup():
 # 레벨업 알림을 보낼 채널 ID (None이면 알림을 보내지 않습니다)
 LEVELUP_CHANNEL_ID = 1558779046119219293
 
+# 활동 레벨 10단위(10, 20, 30...)를 달성할 때마다 솔 에르다 조각을 지급합니다.
+# 이 조각은 출석 시스템의 sol_erda_pieces(/출석확인, /포춘쿠키와 같은 값)에 합산되며,
+# 출석/포춘쿠키와 마찬가지로 MAX_SOL_ERDA_PIECES(30개)를 넘겨 쌓이지 않습니다.
+LEVEL_REWARD_INTERVAL = 10
+LEVEL_REWARD_PIECES = 5
+
 def _apply_voice_exp_sync(gains: dict):
-    """경험치를 지급하고, 레벨업한 (user_id, 새 레벨) 목록을 돌려줍니다."""
+    """경험치를 지급하고, 레벨업한 유저 목록을 돌려줍니다.
+    각 항목: {"user_id", "level", "milestones", "pieces_gained", "pieces_total"}
+    (milestones = 이번에 새로 달성한 10레벨 단위 개수)"""
     level_ups = []
     conn = get_db_connection_plain()
     try:
@@ -595,17 +604,64 @@ def _apply_voice_exp_sync(gains: dict):
                 """,
                 (user_id, level, exp),
             )
+
             if level > old_level:
-                level_ups.append((user_id, level))
+                milestones = level // LEVEL_REWARD_INTERVAL - old_level // LEVEL_REWARD_INTERVAL
+                pieces_gained, pieces_total = 0, None
+                if milestones > 0:
+                    cur.execute(
+                        "SELECT COALESCE(sol_erda_pieces, 0) FROM attendance_users WHERE user_id = %s",
+                        (user_id,),
+                    )
+                    prow = cur.fetchone()
+                    current = prow[0] if prow else 0
+                    pieces_total = min(current + milestones * LEVEL_REWARD_PIECES, MAX_SOL_ERDA_PIECES)
+                    pieces_total = max(pieces_total, current)  # 이미 한도를 넘은 값은 깎지 않음
+                    pieces_gained = pieces_total - current
+                    if pieces_gained > 0:
+                        cur.execute(
+                            """
+                            INSERT INTO attendance_users (user_id, sol_erda_pieces) VALUES (%s, %s)
+                            ON CONFLICT (user_id) DO UPDATE SET sol_erda_pieces = EXCLUDED.sol_erda_pieces
+                            """,
+                            (user_id, pieces_total),
+                        )
+                level_ups.append({
+                    "user_id": user_id,
+                    "level": level,
+                    "milestones": milestones,
+                    "pieces_gained": pieces_gained,
+                    "pieces_total": pieces_total,
+                })
         conn.commit()
         cur.close()
     finally:
         conn.close()
     return level_ups
 
-async def award_voice_exp():
+def tick_voice_progress(present: dict) -> dict:
+    """1분마다 호출됩니다. present = {user_id: 현재 방의 6분당 EXP}.
+    6분을 꽉 채운 유저의 {user_id: 지급 EXP}를 돌려줍니다."""
     gains = {}
-    active = set()
+    for user_id, rate in present.items():
+        state = voice_exp_pending.get(user_id)
+        if state is None or state[0] != rate:
+            # 처음 감지됐거나 EXP 등급이 다른 방으로 옮긴 경우: 여기서부터 6분을 새로 셉니다.
+            voice_exp_pending[user_id] = [rate, 0]
+            continue
+        state[1] += 1
+        if state[1] >= 6:
+            gains[user_id] = rate
+            state[1] = 0
+
+    # 대상 방을 나간 사람은 진행도 초기화
+    for uid in list(voice_exp_pending):
+        if uid not in present:
+            del voice_exp_pending[uid]
+    return gains
+
+async def award_voice_exp():
+    present = {}
     for guild in bot.guilds:
         for vc in guild.voice_channels:
             rate = get_voice_exp_rate(vc)
@@ -614,18 +670,9 @@ async def award_voice_exp():
             for member in vc.members:
                 if member.bot:
                     continue
-                active.add(member.id)
-                # 1분마다 rate/6 EXP씩 쌓이므로, 1/6 EXP 단위로 rate만큼 더합니다.
-                units = voice_exp_pending.get(member.id, 0) + rate
-                whole, remainder = divmod(units, 6)
-                voice_exp_pending[member.id] = remainder
-                if whole > 0:
-                    gains[member.id] = gains.get(member.id, 0) + whole
+                present[member.id] = rate
 
-    # 음성방을 나간 사람의 남은 조각은 초기화
-    for uid in list(voice_exp_pending):
-        if uid not in active:
-            del voice_exp_pending[uid]
+    gains = tick_voice_progress(present)
 
     if gains:
         level_ups = await asyncio.to_thread(_apply_voice_exp_sync, gains)
@@ -635,9 +682,16 @@ async def award_voice_exp():
             if channel is None:
                 print(f"레벨업 채널을 찾을 수 없습니다: {LEVELUP_CHANNEL_ID}")
             else:
-                for user_id, new_level in level_ups:
+                for lu in level_ups:
+                    msg = f"🎉 <@{lu['user_id']}>님이 활동 레벨 **Lv. {lu['level']}**을(를) 달성했습니다!"
+                    if lu["milestones"] > 0:
+                        if lu["pieces_gained"] > 0:
+                            msg += (f"\n💎 10레벨 단위 달성 보상으로 솔 에르다 조각 **{lu['pieces_gained']}개**를 받았습니다! "
+                                    f"(보유 {lu['pieces_total']}개)")
+                        else:
+                            msg += f"\n💎 솔 에르다 조각이 이미 최대치({MAX_SOL_ERDA_PIECES}개)라 보상은 지급되지 않았습니다."
                     try:
-                        await channel.send(f"🎉 <@{user_id}>님이 활동 레벨 **Lv. {new_level}**을(를) 달성했습니다!")
+                        await channel.send(msg)
                     except Exception as e:
                         print(f"레벨업 알림 전송 실패: {e}")
 
