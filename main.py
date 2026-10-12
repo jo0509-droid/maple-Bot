@@ -1530,6 +1530,7 @@ def init_maple_db():
     conn.commit()
     cur.close()
     conn.close()
+    init_growth_db()
 
 
 # ------------------------------------------
@@ -2232,6 +2233,282 @@ async def maple_diagnose(interaction: discord.Interaction, nickname: str = None)
     await run_maple(interaction, build, ephemeral=True)
 
 
+# ------------------------------------------
+# 2단계: 성장 기록 (일일 스냅샷 / 성장 조회 / 주간 성장 랭킹)
+# ------------------------------------------
+WEEKLY_RANKING_CHANNEL_ID = MAPLE_NOTICE_CHANNEL_ID   # 주간 성장 랭킹을 올릴 채널 (바꾸려면 여기 ID만 수정)
+OFFICIAL_PROBABILITY_URL = "https://maplestory.nexon.com/Guide/OtherProbability"
+
+
+def init_growth_db():
+    conn = get_db_connection_plain()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS maple_snapshots (
+            user_id BIGINT NOT NULL,
+            snap_date TEXT NOT NULL,
+            character_name TEXT,
+            level INTEGER,
+            exp BIGINT,
+            combat_power BIGINT,
+            union_level INTEGER,
+            PRIMARY KEY (user_id, snap_date)
+        )
+        """
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def _to_int(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+async def take_snapshot_for(user_id, char_name, ocid, snap_date):
+    """한 명의 현재 상태를 저장합니다. 성공하면 True."""
+    basic = await nexon_get("/maplestory/v1/character/basic", {"ocid": ocid}, ttl=0)
+    level = _to_int(basic.get("character_level"))
+    exp = _to_int(basic.get("character_exp"))
+    name = basic.get("character_name") or char_name
+    power = None
+    union_level = None
+    try:
+        stat = await nexon_get("/maplestory/v1/character/stat", {"ocid": ocid}, ttl=0)
+        for s in stat.get("final_stat", []) or []:
+            if s.get("stat_name") == "전투력":
+                power = _to_int(s.get("stat_value"))
+                break
+    except MapleAPIError:
+        pass
+    try:
+        u = await nexon_get("/maplestory/v1/user/union", {"ocid": ocid}, ttl=0)
+        union_level = _to_int(u.get("union_level"))
+    except MapleAPIError:
+        pass
+    if level is None:
+        return False
+    await adb(
+        """
+        INSERT INTO maple_snapshots (user_id, snap_date, character_name, level, exp, combat_power, union_level)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (user_id, snap_date) DO UPDATE SET character_name=EXCLUDED.character_name,
+            level=EXCLUDED.level, exp=EXCLUDED.exp, combat_power=EXCLUDED.combat_power,
+            union_level=EXCLUDED.union_level
+        """,
+        (user_id, snap_date, name, level, exp, power, union_level))
+    if name != char_name:
+        await adb("UPDATE maple_verifications SET character_name=%s WHERE user_id=%s", (name, user_id))
+    return True
+
+
+async def take_all_snapshots():
+    rows = await adb("SELECT user_id, character_name, ocid FROM maple_verifications", (), "all")
+    today = kst_date_str(0)
+    ok = fail = 0
+    for user_id, char_name, ocid in rows:
+        try:
+            if await take_snapshot_for(user_id, char_name, ocid, today):
+                ok += 1
+            else:
+                fail += 1
+        except Exception as e:
+            fail += 1
+            print(f"[성장 기록] {char_name} 저장 실패: {e}")
+        await asyncio.sleep(0.2)
+    print(f"[성장 기록] {today} 스냅샷 완료: 성공 {ok} / 실패 {fail}")
+    return ok, fail
+
+
+@tasks.loop(time=dt_time(hour=4, minute=30, tzinfo=KST))
+async def maple_daily_snapshot():
+    """매일 04:30(KST): 인증된 길드원의 레벨/경험치/전투력/유니온을 기록합니다."""
+    await take_all_snapshots()
+
+
+@maple_daily_snapshot.before_loop
+async def _before_maple_daily_snapshot():
+    await bot.wait_until_ready()
+
+
+def _delta_text(new, old, big=False):
+    if new is None or old is None:
+        return "-"
+    d = new - old
+    f = fmt_korean_big if big else fmt_num
+    sign = "+" if d > 0 else ("-" if d < 0 else "±")
+    return f"{f(new)} ({sign}{f(abs(d))})"
+
+
+async def load_window(user_id, days):
+    """기간 시작 이후 가장 오래된 기록과 가장 최근 기록을 돌려줍니다."""
+    cutoff = kst_date_str(days)
+    cols = "snap_date, character_name, level, exp, combat_power, union_level"
+    first = await adb(
+        f"SELECT {cols} FROM maple_snapshots WHERE user_id=%s AND snap_date>=%s ORDER BY snap_date ASC LIMIT 1",
+        (user_id, cutoff), "one")
+    last = await adb(
+        f"SELECT {cols} FROM maple_snapshots WHERE user_id=%s ORDER BY snap_date DESC LIMIT 1",
+        (user_id,), "one")
+    return first, last
+
+
+@bot.tree.command(name="성장", description="인증된 내 캐릭터의 최근 성장(레벨/전투력/유니온 변화)을 봅니다.")
+@app_commands.rename(days="기간", target="대상")
+@app_commands.describe(days="비교 기간", target="다른 인증 유저 (비우면 나)")
+@app_commands.choices(days=[
+    app_commands.Choice(name="최근 7일", value=7),
+    app_commands.Choice(name="최근 30일", value=30),
+])
+async def maple_growth(interaction: discord.Interaction, days: app_commands.Choice[int] = None, target: discord.Member = None):
+    period = days.value if days else 7
+    user = target or interaction.user
+
+    async def build():
+        row = await adb("SELECT character_name FROM maple_verifications WHERE user_id=%s", (user.id,), "one")
+        if not row:
+            raise UserFacingError("인증된 캐릭터가 없어요. `/인증`으로 먼저 인증을 받아주세요." if user.id == interaction.user.id
+                                  else "해당 유저는 인증된 캐릭터가 없어요.")
+        first, last = await load_window(user.id, period)
+        if not last:
+            raise UserFacingError("아직 성장 기록이 없어요. 기록은 매일 새벽 4시 30분에 저장되니 내일부터 확인할 수 있어요.")
+        if first[0] == last[0]:
+            raise UserFacingError(f"비교할 기록이 하루치뿐이에요. (기록 시작일: {last[0]}) 내일부터 변화량이 표시돼요.")
+        e = maple_embed(f"📈 {last[1]} 성장 기록 ({first[0]} → {last[0]})")
+        e.add_field(name="레벨", value=_delta_text(last[2], first[2]), inline=True)
+        if last[3] is not None and first[3] is not None and last[2] == first[2]:
+            e.add_field(name="경험치 증가량", value=fmt_num(last[3] - first[3]), inline=True)
+        e.add_field(name="전투력", value=_delta_text(last[4], first[4], big=True), inline=False)
+        e.add_field(name="유니온 레벨", value=_delta_text(last[5], first[5]), inline=True)
+        e.set_footer(text="매일 새벽 4시 30분 기준 기록 · 넥슨 오픈 API")
+        return e
+
+    await run_maple(interaction, build)
+
+
+@bot.tree.command(name="성장랭킹", description="인증된 길드원들의 성장 랭킹 (기간 내 증가량 기준)")
+@app_commands.rename(metric="기준", days="기간")
+@app_commands.describe(metric="랭킹 기준", days="비교 기간")
+@app_commands.choices(
+    metric=[
+        app_commands.Choice(name="전투력", value="power"),
+        app_commands.Choice(name="레벨", value="level"),
+        app_commands.Choice(name="유니온 레벨", value="union"),
+    ],
+    days=[
+        app_commands.Choice(name="최근 7일", value=7),
+        app_commands.Choice(name="최근 30일", value=30),
+    ],
+)
+async def maple_growth_ranking(interaction: discord.Interaction, metric: app_commands.Choice[str], days: app_commands.Choice[int] = None):
+    period = days.value if days else 7
+
+    async def build():
+        return await build_growth_ranking_embed(metric.value, period, top=10)
+
+    await run_maple(interaction, build)
+
+
+METRIC_LABEL = {"power": "전투력", "level": "레벨", "union": "유니온 레벨"}
+
+
+async def build_growth_ranking_embed(metric, period, top=10):
+    cutoff = kst_date_str(period)
+    rows = await adb(
+        "SELECT user_id, snap_date, character_name, level, exp, combat_power, union_level "
+        "FROM maple_snapshots WHERE snap_date>=%s ORDER BY user_id, snap_date",
+        (cutoff,), "all")
+    by_user = {}
+    for r in rows:
+        by_user.setdefault(r[0], []).append(r)
+    results = []
+    for uid, recs in by_user.items():
+        if len(recs) < 2:
+            continue
+        a, b = recs[0], recs[-1]
+        if metric == "power":
+            if a[5] is None or b[5] is None:
+                continue
+            gain, text = b[5] - a[5], f"{fmt_korean_big(b[5])} ({'+' if b[5]-a[5] >= 0 else '-'}{fmt_korean_big(abs(b[5]-a[5]))})"
+            key = (gain,)
+        elif metric == "level":
+            if a[3] is None or b[3] is None:
+                continue
+            exp_gain = (b[4] or 0) - (a[4] or 0)
+            gain = b[3] - a[3]
+            text = f"Lv.{b[3]} (+{gain})"
+            key = (gain, exp_gain)
+        else:
+            if a[6] is None or b[6] is None:
+                continue
+            gain, text = b[6] - a[6], f"{fmt_num(b[6])} ({'+' if b[6]-a[6] >= 0 else '-'}{fmt_num(abs(b[6]-a[6]))})"
+            key = (gain,)
+        results.append((key, uid, b[2], text, gain))
+    results.sort(key=lambda x: x[0], reverse=True)
+    e = maple_embed(f"🏆 성장 랭킹 · {METRIC_LABEL[metric]} · 최근 {period}일", color=0xF1C40F)
+    shown = [r for r in results if r[4] > 0][:top]
+    if not shown:
+        e.description = "비교할 수 있는 기록이 아직 부족하거나 증가한 사람이 없어요. (기록은 매일 새벽 4시 30분에 저장돼요)"
+        return e
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (_, uid, name, text, _) in enumerate(shown):
+        mark = medals[i] if i < 3 else f"`{i + 1}위`"
+        lines.append(f"{mark} **{name}** <@{uid}> — {text}")
+    e.description = "\n".join(lines)
+    e.set_footer(text=f"인증된 길드원 {len(by_user)}명 중 비교 가능 {len(results)}명")
+    return e
+
+
+@tasks.loop(time=dt_time(hour=9, minute=0, tzinfo=KST))
+async def maple_weekly_growth_post():
+    """매주 월요일 09:00(KST): 지난 7일 성장 랭킹을 공지 채널에 올립니다."""
+    if datetime.now(KST).weekday() != 0:
+        return
+    ch = bot.get_channel(WEEKLY_RANKING_CHANNEL_ID)
+    if not ch:
+        return
+    try:
+        embeds = [await build_growth_ranking_embed("power", 7, top=5),
+                  await build_growth_ranking_embed("level", 7, top=5)]
+        await ch.send(content="📊 **이번 주 길드 성장 랭킹**", embeds=embeds)
+    except Exception as e:
+        print(f"[주간 성장 랭킹] 오류: {e}")
+
+
+@maple_weekly_growth_post.before_loop
+async def _before_maple_weekly_growth_post():
+    await bot.wait_until_ready()
+
+
+@bot.tree.command(name="성장기록저장", description="[운영진] 지금 바로 인증된 길드원의 성장 기록을 저장합니다.")
+@app_commands.default_permissions(manage_roles=True)
+async def maple_snapshot_now(interaction: discord.Interaction):
+    if not _is_verify_admin(interaction.user):
+        await interaction.response.send_message("❌ 운영진만 사용할 수 있어요.", ephemeral=True)
+        return
+
+    async def build():
+        ok, fail = await take_all_snapshots()
+        return f"✅ 성장 기록 저장 완료 (성공 {ok}명 / 실패 {fail}명)"
+
+    await run_maple(interaction, build, ephemeral=True)
+
+
+@bot.tree.command(name="확률", description="메이플스토리 공식 확률 정보 페이지 링크를 안내합니다.")
+async def maple_probability(interaction: discord.Interaction):
+    e = maple_embed("🎲 공식 확률 정보")
+    e.description = (
+        f"[메이플스토리 공식 확률 정보 페이지]({OFFICIAL_PROBABILITY_URL})\n"
+        "큐브·스타포스 등 확률은 업데이트로 자주 바뀌기 때문에, 항상 최신인 공식 페이지에서 확인해주세요."
+    )
+    await interaction.response.send_message(embed=e)
+
+
 def start_maple_background_tasks():
     """API 키가 있을 때만 메이플 관련 반복 작업을 시작합니다."""
     if not NEXON_API_KEY:
@@ -2241,6 +2518,10 @@ def start_maple_background_tasks():
         maple_notice_check.start()
     if not maple_guild_member_check.is_running():
         maple_guild_member_check.start()
+    if not maple_daily_snapshot.is_running():
+        maple_daily_snapshot.start()
+    if not maple_weekly_growth_post.is_running():
+        maple_weekly_growth_post.start()
 
 
 # 봇 실행부
