@@ -1264,6 +1264,7 @@ NEXON_BASE_URL = "https://open.api.nexon.com"
 MAPLE_GUILD_NAME = "유치원"
 MAPLE_WORLD_NAME = "스카니아"
 VERIFIED_ROLE_NAME = "병아리반"
+UNVERIFIED_ROLE_KEYWORD = "미인증"   # 이 글자가 이름에 들어간 역할은 인증 승인 시 자동으로 회수됩니다
 VERIFY_REQUEST_CHANNEL_ID = 1559168660789010504   # 인증 신청 받는 채널
 VERIFY_ADMIN_CHANNEL_ID = 1559168759896215552     # 운영진 승인 채널
 MAPLE_NOTICE_CHANNEL_ID = 1559168922194804807     # 공지 알림 채널
@@ -1938,6 +1939,18 @@ async def handle_verify_decision(interaction: discord.Interaction, request_id: i
                 problem = "봇에게 역할 부여 권한이 없습니다. (봇 역할이 `병아리반`보다 위에 있고 '역할 관리' 권한이 필요해요)"
             except Exception as e:
                 problem = f"역할 부여 실패: {e}"
+            else:
+                # 미인증 역할 회수 (실패해도 승인 자체는 유지)
+                try:
+                    stale = [r for r in member.roles if UNVERIFIED_ROLE_KEYWORD in r.name and r != role]
+                    if stale:
+                        await member.remove_roles(*stale, reason=f"메이플 길드원 인증 승인 ({char_name})")
+                except Exception as e:
+                    print(f"[인증] 미인증 역할 회수 실패: {e}")
+                    try:
+                        await interaction.followup.send(f"⚠️ 병아리반은 부여했지만 미인증 역할 회수에 실패했어요: {e}\n(봇 역할이 미인증 역할보다 위에 있어야 해요)", ephemeral=True)
+                    except Exception:
+                        pass
         if problem:
             # 되돌려서 다시 시도할 수 있게 합니다.
             await adb("UPDATE maple_verify_requests SET status='pending', decided_by=NULL, decided_at=NULL WHERE id=%s", (request_id,))
