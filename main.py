@@ -58,10 +58,15 @@ def init_attendance_db():
         CREATE TABLE IF NOT EXISTS activity_users (
             user_id BIGINT PRIMARY KEY,
             level INTEGER DEFAULT 1,
-            exp INTEGER DEFAULT 0
+            exp INTEGER DEFAULT 0,
+            daily_exp INTEGER DEFAULT 0,
+            daily_date TEXT
         )
         """
     )
+    # 이미 테이블이 만들어져 있는 경우를 위한 컬럼 추가 (있으면 건너뜀 - 데이터 유지됨)
+    cursor.execute("ALTER TABLE activity_users ADD COLUMN IF NOT EXISTS daily_exp INTEGER DEFAULT 0")
+    cursor.execute("ALTER TABLE activity_users ADD COLUMN IF NOT EXISTS daily_date TEXT")
     conn.commit()
     cursor.close()
     conn.close()
@@ -580,29 +585,48 @@ LEVELUP_CHANNEL_ID = 1558779046119219293
 LEVEL_REWARD_INTERVAL = 10
 LEVEL_REWARD_PIECES = 5
 
+# 하루(KST 0시 기준)에 음성방 활동으로 얻을 수 있는 최대 경험치
+DAILY_ACTIVITY_EXP_LIMIT = 500
+
 def _apply_voice_exp_sync(gains: dict):
     """경험치를 지급하고, 레벨업한 유저 목록을 돌려줍니다.
     각 항목: {"user_id", "level", "milestones", "pieces_gained", "pieces_total"}
     (milestones = 이번에 새로 달성한 10레벨 단위 개수)"""
     level_ups = []
+    today_str = datetime.now(KST).strftime("%Y-%m-%d")
     conn = get_db_connection_plain()
     try:
         cur = conn.cursor()
         for user_id, gain in gains.items():
-            cur.execute("SELECT level, exp FROM activity_users WHERE user_id = %s", (user_id,))
+            cur.execute(
+                "SELECT level, exp, COALESCE(daily_exp, 0), daily_date FROM activity_users WHERE user_id = %s",
+                (user_id,),
+            )
             row = cur.fetchone()
-            level, exp = (row[0], row[1]) if row else (1, 0)
+            level, exp, daily_exp, daily_date = (row[0], row[1], row[2], row[3]) if row else (1, 0, 0, None)
+
+            # 날짜가 바뀌었으면 오늘 획득량을 0부터 다시 셉니다.
+            if daily_date != today_str:
+                daily_exp = 0
+
+            # 하루 획득 한도(DAILY_ACTIVITY_EXP_LIMIT)를 넘는 만큼은 지급하지 않습니다.
+            gain = min(gain, max(0, DAILY_ACTIVITY_EXP_LIMIT - daily_exp))
+            if gain <= 0:
+                continue
+
             old_level = level
             exp += gain
+            daily_exp += gain
             while exp >= activity_exp_required(level):
                 exp -= activity_exp_required(level)
                 level += 1
             cur.execute(
                 """
-                INSERT INTO activity_users (user_id, level, exp) VALUES (%s, %s, %s)
-                ON CONFLICT (user_id) DO UPDATE SET level = EXCLUDED.level, exp = EXCLUDED.exp
+                INSERT INTO activity_users (user_id, level, exp, daily_exp, daily_date) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET level = EXCLUDED.level, exp = EXCLUDED.exp,
+                    daily_exp = EXCLUDED.daily_exp, daily_date = EXCLUDED.daily_date
                 """,
-                (user_id, level, exp),
+                (user_id, level, exp, daily_exp, today_str),
             )
 
             if level > old_level:
@@ -1077,10 +1101,16 @@ def _get_activity_data_sync(user_id: int):
     conn = get_db_connection_plain()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT level, exp FROM activity_users WHERE user_id = %s", (user_id,))
+        cur.execute(
+            "SELECT level, exp, COALESCE(daily_exp, 0), daily_date FROM activity_users WHERE user_id = %s",
+            (user_id,),
+        )
         row = cur.fetchone()
         cur.close()
-        return (row[0], row[1]) if row else (1, 0)
+        if not row:
+            return (1, 0, 0)
+        today_str = datetime.now(KST).strftime("%Y-%m-%d")
+        return (row[0], row[1], row[2] if row[3] == today_str else 0)
     finally:
         conn.close()
 
@@ -1119,7 +1149,7 @@ async def activity_info(interaction: discord.Interaction, 유저: discord.User =
     target_user = 유저 if 유저 else interaction.user
 
     try:
-        level, exp = await asyncio.to_thread(_get_activity_data_sync, target_user.id)
+        level, exp, today_exp = await asyncio.to_thread(_get_activity_data_sync, target_user.id)
         max_exp = activity_exp_required(level)
 
         filled = int(exp / max_exp * 10)
@@ -1129,6 +1159,7 @@ async def activity_info(interaction: discord.Interaction, 유저: discord.User =
         embed.add_field(name="활동 레벨", value=f"Lv. {level}", inline=True)
         embed.add_field(name="경험치", value=f"{exp:,} / {max_exp:,} EXP", inline=True)
         embed.add_field(name="진행도", value=bar, inline=False)
+        embed.add_field(name="오늘 획득 경험치", value=f"{today_exp:,} / {DAILY_ACTIVITY_EXP_LIMIT:,} EXP", inline=False)
         await interaction.followup.send(embed=embed)
     except Exception as e:
         print(f"활동정보 오류: {e}")
