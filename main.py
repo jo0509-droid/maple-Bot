@@ -1,9 +1,13 @@
 from datetime import datetime, timedelta, timezone
+from datetime import time as dt_time
 import os
+import json
+import time
 import random
 import asyncio
 
 import psycopg2
+import aiohttp
 
 from flask import Flask
 from threading import Thread
@@ -70,6 +74,7 @@ def init_attendance_db():
     conn.commit()
     cursor.close()
     conn.close()
+    init_maple_db()
 
 # ----------------------------------------
 # Render 웹서버 설정
@@ -450,6 +455,13 @@ async def on_interaction(interaction: discord.Interaction):
             except ValueError:
                 return
             await handle_end_trade_button(interaction, seller_id, original_channel_id, original_message_id)
+
+        elif custom_id.startswith("verify_approve:") or custom_id.startswith("verify_reject:"):
+            try:
+                request_id = int(custom_id.split(":", 1)[1])
+            except (IndexError, ValueError):
+                return
+            await handle_verify_decision(interaction, request_id, custom_id.startswith("verify_approve:"))
     except Exception as e:
         import traceback
         print(f"[구매/거래끝내기 처리 오류] custom_id={custom_id} error={e!r}")
@@ -471,6 +483,7 @@ async def on_ready():
     init_attendance_db()
     if not check_voice_time.is_running():
         check_voice_time.start()
+    start_maple_background_tasks()
 
     # "나도 등록하기" 버튼이 재배포 후에도 계속 작동하도록 다시 등록합니다.
     # (custom_id가 고정되어 있어야 하고, 이 등록은 봇 프로세스당 한 번만 하면 됩니다)
@@ -1241,6 +1254,978 @@ async def activity_modify(interaction: discord.Interaction, 유저: discord.User
         await interaction.followup.send(f"❌ 수정 중 오류 발생: {e}", ephemeral=True)
 
 # ------------------------------------------
+# ==========================================
+# 메이플스토리 오픈 API 기능 (조회 / 길드원 인증 / 공지 알림 / 진단)
+# ==========================================
+# NEXON_API_KEY 는 Render > Environment 에만 넣으세요. (코드/채팅에 절대 붙여넣지 마세요)
+NEXON_API_KEY = os.getenv("NEXON_API_KEY") or os.getenv("NX_OPEN_API_KEY")
+NEXON_BASE_URL = "https://open.api.nexon.com"
+
+MAPLE_GUILD_NAME = "유치원"
+MAPLE_WORLD_NAME = "스카니아"
+VERIFIED_ROLE_NAME = "병아리반"
+VERIFY_REQUEST_CHANNEL_ID = 1559168660789010504   # 인증 신청 받는 채널
+VERIFY_ADMIN_CHANNEL_ID = 1559168759896215552     # 운영진 승인 채널
+MAPLE_NOTICE_CHANNEL_ID = 1559168922194804807     # 공지 알림 채널
+
+_nexon_session = None
+_nexon_semaphore = asyncio.Semaphore(4)
+_nexon_cache = {}       # key -> (만료 시각, 데이터)
+NEXON_CACHE_TTL = 300   # 초
+OCID_CACHE_TTL = 3600
+
+
+class UserFacingError(Exception):
+    """사용자에게 그대로 보여줄 수 있는 안내 메시지용 예외"""
+
+
+class MapleAPIError(UserFacingError):
+    pass
+
+
+NEXON_ERROR_MESSAGES = {
+    "OPENAPI00001": "넥슨 서버 내부 오류입니다. 잠시 후 다시 시도해주세요.",
+    "OPENAPI00002": "넥슨 API 접근 권한이 없습니다. (API 키 권한 확인 필요)",
+    "OPENAPI00003": "존재하지 않는 캐릭터/길드이거나 식별자가 올바르지 않습니다. 이름을 확인해주세요.",
+    "OPENAPI00004": "요청 파라미터가 올바르지 않습니다.",
+    "OPENAPI00005": "넥슨 API 키가 올바르지 않습니다. (관리자에게 문의해주세요)",
+    "OPENAPI00006": "지원하지 않는 API 경로입니다.",
+    "OPENAPI00007": "요청이 너무 많습니다. 잠시 후 다시 시도해주세요.",
+    "OPENAPI00009": "아직 해당 데이터가 준비되지 않았습니다. (매일 오전 2시 이후 전일 데이터 제공)",
+    "OPENAPI00010": "게임 점검 중입니다.",
+    "OPENAPI00011": "넥슨 API 점검 중입니다.",
+}
+
+
+async def _get_nexon_session():
+    global _nexon_session
+    if _nexon_session is None or _nexon_session.closed:
+        _nexon_session = aiohttp.ClientSession(
+            headers={"x-nxopen-api-key": NEXON_API_KEY or ""},
+            timeout=aiohttp.ClientTimeout(total=15),
+        )
+    return _nexon_session
+
+
+async def nexon_get(path, params=None, ttl=NEXON_CACHE_TTL):
+    """넥슨 오픈 API GET. 캐시 + 속도제한 시 재시도. 실패하면 MapleAPIError."""
+    if not NEXON_API_KEY:
+        raise MapleAPIError("넥슨 API 키(NEXON_API_KEY)가 설정되어 있지 않습니다. 관리자에게 문의해주세요.")
+
+    params = {k: v for k, v in (params or {}).items() if v is not None}
+    cache_key = (path, tuple(sorted(params.items())))
+    now = time.monotonic()
+    hit = _nexon_cache.get(cache_key)
+    if hit and hit[0] > now:
+        return hit[1]
+
+    last_err = None
+    for attempt in range(3):
+        try:
+            async with _nexon_semaphore:
+                session = await _get_nexon_session()
+                async with session.get(NEXON_BASE_URL + path, params=params) as resp:
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:
+                        data = None
+                    status = resp.status
+        except asyncio.TimeoutError:
+            last_err = MapleAPIError("넥슨 서버 응답이 늦습니다. 잠시 후 다시 시도해주세요.")
+            await asyncio.sleep(1)
+            continue
+        except aiohttp.ClientError as e:
+            last_err = MapleAPIError(f"넥슨 서버에 연결하지 못했습니다. ({type(e).__name__})")
+            await asyncio.sleep(1)
+            continue
+
+        if status == 200 and isinstance(data, dict):
+            # 일부 응답은 오류를 200으로 주지 않지만, 안전하게 error 키도 확인합니다.
+            if "error" not in data:
+                if len(_nexon_cache) > 2000:
+                    _nexon_cache.clear()
+                _nexon_cache[cache_key] = (now + ttl, data)
+                return data
+
+        err = (data or {}).get("error", {}) if isinstance(data, dict) else {}
+        code = err.get("name") or ""
+        msg = NEXON_ERROR_MESSAGES.get(code)
+        if code == "OPENAPI00007" or status == 429:
+            last_err = MapleAPIError(NEXON_ERROR_MESSAGES["OPENAPI00007"])
+            await asyncio.sleep(1.5 * (attempt + 1))
+            continue
+        if code in ("OPENAPI00001",) or status >= 500:
+            last_err = MapleAPIError(msg or "넥슨 서버 오류입니다. 잠시 후 다시 시도해주세요.")
+            await asyncio.sleep(1)
+            continue
+        raise MapleAPIError(msg or f"넥슨 API 오류 ({status} {code or '알 수 없음'}): {err.get('message', '')}".strip())
+
+    raise last_err or MapleAPIError("넥슨 API 요청에 실패했습니다.")
+
+
+_ocid_cache = {}
+
+
+async def get_ocid(character_name):
+    name = character_name.strip()
+    if not name:
+        raise MapleAPIError("캐릭터 닉네임을 입력해주세요.")
+    key = name.lower()
+    hit = _ocid_cache.get(key)
+    if hit and hit[0] > time.monotonic():
+        return hit[1]
+    try:
+        data = await nexon_get("/maplestory/v1/id", {"character_name": name}, ttl=OCID_CACHE_TTL)
+    except MapleAPIError as e:
+        if "존재하지 않는" in str(e):
+            raise MapleAPIError(f"`{name}` 캐릭터를 찾을 수 없습니다. 닉네임을 정확히 입력해주세요. (2023-12-21 이후 접속 기록이 있는 캐릭터만 조회됩니다)")
+        raise
+    ocid = data.get("ocid")
+    if not ocid:
+        raise MapleAPIError(f"`{name}` 캐릭터를 찾을 수 없습니다.")
+    _ocid_cache[key] = (time.monotonic() + OCID_CACHE_TTL, ocid)
+    return ocid
+
+
+def kst_date_str(days_ago=0):
+    return (datetime.now(KST) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+
+
+# ------------------------------------------
+# 포맷 도우미
+# ------------------------------------------
+def fmt_num(v):
+    try:
+        return f"{int(float(v)):,}"
+    except (TypeError, ValueError):
+        return str(v) if v not in (None, "") else "-"
+
+
+def fmt_korean_big(v):
+    """123456789 -> '1억 2,345만 6,789'"""
+    try:
+        n = int(float(v))
+    except (TypeError, ValueError):
+        return str(v) if v not in (None, "") else "-"
+    if n < 10000:
+        return f"{n:,}"
+    eok, rest = divmod(n, 100_000_000)
+    man, one = divmod(rest, 10_000)
+    parts = []
+    if eok:
+        parts.append(f"{eok:,}억")
+    if man:
+        parts.append(f"{man:,}만")
+    if one:
+        parts.append(f"{one:,}")
+    return " ".join(parts)
+
+
+def safe_text(v, default="-"):
+    return str(v) if v not in (None, "") else default
+
+
+def chunk_lines(lines, limit=1000):
+    chunks, cur = [], ""
+    for line in lines:
+        if len(cur) + len(line) + 1 > limit and cur:
+            chunks.append(cur)
+            cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        chunks.append(cur)
+    return chunks
+
+
+def maple_embed(title, description=None, color=0xF5A623):
+    return discord.Embed(title=title, description=description, color=color)
+
+
+async def run_maple(interaction, builder, ephemeral=False):
+    """defer -> builder() (Embed 또는 문자열 반환) -> 결과 전송. 오류는 친절한 메시지로."""
+    try:
+        await interaction.response.defer(ephemeral=ephemeral, thinking=True)
+    except Exception:
+        pass
+    try:
+        result = await builder()
+        if isinstance(result, discord.Embed):
+            await interaction.followup.send(embed=result)
+        elif isinstance(result, (list, tuple)):
+            await interaction.followup.send(embeds=list(result))
+        else:
+            await interaction.followup.send(str(result))
+    except UserFacingError as e:
+        await interaction.followup.send(f"❌ {e}", ephemeral=True)
+    except Exception as e:
+        import traceback
+        print(f"[메이플 명령어 오류] {e!r}")
+        traceback.print_exc()
+        try:
+            await interaction.followup.send(f"❌ 처리 중 오류가 발생했습니다: `{e}`", ephemeral=True)
+        except Exception:
+            pass
+
+
+def db_exec(sql, params=(), fetch="none"):
+    """동기 DB 실행 도우미 (asyncio.to_thread 로 호출). fetch: none / one / all"""
+    conn = get_db_connection_plain()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        result = None
+        if fetch == "one":
+            result = cur.fetchone()
+        elif fetch == "all":
+            result = cur.fetchall()
+        conn.commit()
+        cur.close()
+        return result
+    finally:
+        conn.close()
+
+
+async def adb(sql, params=(), fetch="none"):
+    return await asyncio.to_thread(db_exec, sql, params, fetch)
+
+
+def init_maple_db():
+    conn = get_db_connection_plain()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS maple_verify_requests (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            character_name TEXT NOT NULL,
+            ocid TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT,
+            decided_by BIGINT,
+            decided_at TEXT,
+            admin_message_id BIGINT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS maple_verifications (
+            user_id BIGINT PRIMARY KEY,
+            character_name TEXT NOT NULL,
+            ocid TEXT NOT NULL,
+            verified_at TEXT,
+            approved_by BIGINT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS maple_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+# ------------------------------------------
+# 조회 명령어
+# ------------------------------------------
+@bot.tree.command(name="캐릭터", description="메이플스토리 캐릭터 정보를 조회합니다.")
+@app_commands.rename(nickname="닉네임")
+@app_commands.describe(nickname="조회할 캐릭터 닉네임")
+async def maple_character(interaction: discord.Interaction, nickname: str):
+    async def build():
+        ocid = await get_ocid(nickname)
+        basic = await nexon_get("/maplestory/v1/character/basic", {"ocid": ocid})
+        stat = pop = dojang = union = None
+        try:
+            stat = await nexon_get("/maplestory/v1/character/stat", {"ocid": ocid})
+        except MapleAPIError:
+            pass
+        try:
+            pop = await nexon_get("/maplestory/v1/character/popularity", {"ocid": ocid})
+        except MapleAPIError:
+            pass
+        try:
+            dojang = await nexon_get("/maplestory/v1/character/dojang", {"ocid": ocid})
+        except MapleAPIError:
+            pass
+        try:
+            union = await nexon_get("/maplestory/v1/user/union", {"ocid": ocid})
+        except MapleAPIError:
+            pass
+
+        e = maple_embed(f"{basic.get('character_name', nickname)}", color=0xF5A623)
+        e.description = (
+            f"**{safe_text(basic.get('world_name'))}** · {safe_text(basic.get('character_class'))}\n"
+            f"Lv.{safe_text(basic.get('character_level'))} ({safe_text(basic.get('character_exp_rate'))}%)"
+        )
+        if basic.get("character_image"):
+            e.set_thumbnail(url=basic["character_image"])
+        e.add_field(name="길드", value=safe_text(basic.get("character_guild_name"), "없음"), inline=True)
+        if pop:
+            e.add_field(name="인기도", value=fmt_num(pop.get("popularity")), inline=True)
+        if stat:
+            for s in stat.get("final_stat", []) or []:
+                if s.get("stat_name") == "전투력":
+                    e.add_field(name="전투력", value=fmt_korean_big(s.get("stat_value")), inline=True)
+                    break
+        if union:
+            e.add_field(
+                name="유니온",
+                value=f"Lv.{fmt_num(union.get('union_level'))} ({safe_text(union.get('union_grade'))})",
+                inline=True,
+            )
+        if dojang and dojang.get("dojang_best_floor") is not None:
+            e.add_field(name="무릉도장 최고 층", value=f"{fmt_num(dojang.get('dojang_best_floor'))}층", inline=True)
+        e.set_footer(text=f"기준일: {safe_text(basic.get('date'), '최신')} · 넥슨 오픈 API (약 15분 지연)")
+        return e
+
+    await run_maple(interaction, build)
+
+
+@bot.tree.command(name="스탯", description="캐릭터의 주요 스탯을 조회합니다.")
+@app_commands.rename(nickname="닉네임")
+@app_commands.describe(nickname="조회할 캐릭터 닉네임")
+async def maple_stat(interaction: discord.Interaction, nickname: str):
+    async def build():
+        ocid = await get_ocid(nickname)
+        stat = await nexon_get("/maplestory/v1/character/stat", {"ocid": ocid})
+        stats = {s.get("stat_name"): s.get("stat_value") for s in stat.get("final_stat", []) or []}
+        e = maple_embed(f"{nickname} 스탯")
+        order = [
+            "전투력", "스탯공격력", "데미지", "보스 몬스터 데미지", "최종 데미지",
+            "방어율 무시", "크리티컬 확률", "크리티컬 데미지", "STR", "DEX", "INT", "LUK", "HP", "MP",
+            "아케인포스", "어센틱포스", "스타포스",
+        ]
+        shown = 0
+        for name in order:
+            if name in stats:
+                v = stats[name]
+                if name == "전투력":
+                    v = fmt_korean_big(v)
+                elif name in ("스탯공격력", "STR", "DEX", "INT", "LUK", "HP", "MP", "아케인포스", "어센틱포스", "스타포스"):
+                    v = fmt_num(v)
+                elif v not in (None, ""):
+                    v = f"{v}%"
+                e.add_field(name=name, value=safe_text(v), inline=True)
+                shown += 1
+        if not shown:
+            raise MapleAPIError("스탯 정보를 가져오지 못했습니다.")
+        e.set_footer(text=f"기준일: {safe_text(stat.get('date'), '최신')} · 넥슨 오픈 API")
+        return e
+
+    await run_maple(interaction, build)
+
+
+@bot.tree.command(name="장비", description="캐릭터가 착용 중인 장비를 조회합니다.")
+@app_commands.rename(nickname="닉네임")
+@app_commands.describe(nickname="조회할 캐릭터 닉네임")
+async def maple_equipment(interaction: discord.Interaction, nickname: str):
+    async def build():
+        ocid = await get_ocid(nickname)
+        data = await nexon_get("/maplestory/v1/character/item-equipment", {"ocid": ocid})
+        items = data.get("item_equipment", []) or []
+        if not items:
+            raise MapleAPIError("착용 중인 장비 정보가 없습니다.")
+        lines = []
+        for it in items:
+            part = safe_text(it.get("item_equipment_slot") or it.get("item_equipment_part"))
+            name = safe_text(it.get("item_name"))
+            sf = it.get("starforce")
+            sf_txt = f" ★{sf}" if sf not in (None, "", "0", 0) else ""
+            pot = it.get("potential_option_grade")
+            add = it.get("additional_potential_option_grade")
+            grade = ""
+            if pot or add:
+                grade = f" [{pot or '-'} / {add or '-'}]"
+            lines.append(f"**{part}** {name}{sf_txt}{grade}")
+        e = maple_embed(f"{nickname} 장비")
+        e.description = "잠재 표기: [윗잠재 / 에디셔널]"
+        for i, chunk in enumerate(chunk_lines(lines, 1000)[:6]):
+            e.add_field(name="착용 장비" if i == 0 else "​", value=chunk, inline=False)
+        e.set_footer(text=f"기준일: {safe_text(data.get('date'), '최신')} · 현재 프리셋 기준 · 넥슨 오픈 API")
+        return e
+
+    await run_maple(interaction, build)
+
+
+@bot.tree.command(name="심볼", description="캐릭터의 심볼 정보를 조회합니다.")
+@app_commands.rename(nickname="닉네임")
+@app_commands.describe(nickname="조회할 캐릭터 닉네임")
+async def maple_symbol(interaction: discord.Interaction, nickname: str):
+    async def build():
+        ocid = await get_ocid(nickname)
+        data = await nexon_get("/maplestory/v1/character/symbol-equipment", {"ocid": ocid})
+        symbols = data.get("symbol", []) or []
+        if not symbols:
+            raise MapleAPIError("장착 중인 심볼이 없습니다.")
+        lines = []
+        for s in symbols:
+            name = safe_text(s.get("symbol_name")).replace("어센틱심볼 : ", "").replace("아케인심볼 : ", "")
+            kind = "어센틱" if "어센틱" in safe_text(s.get("symbol_name"), "") else "아케인"
+            lines.append(
+                f"[{kind}] **{name}** Lv.{safe_text(s.get('symbol_level'))} "
+                f"({safe_text(s.get('symbol_growth_count'))}/{safe_text(s.get('symbol_require_growth_count'))}) "
+                f"· 포스 {fmt_num(s.get('symbol_force'))}"
+            )
+        e = maple_embed(f"{nickname} 심볼")
+        for i, chunk in enumerate(chunk_lines(lines, 1000)[:4]):
+            e.add_field(name="장착 심볼" if i == 0 else "​", value=chunk, inline=False)
+        e.set_footer(text=f"기준일: {safe_text(data.get('date'), '최신')} · 넥슨 오픈 API")
+        return e
+
+    await run_maple(interaction, build)
+
+
+@bot.tree.command(name="유니온", description="캐릭터의 유니온 정보를 조회합니다.")
+@app_commands.rename(nickname="닉네임")
+@app_commands.describe(nickname="조회할 캐릭터 닉네임")
+async def maple_union(interaction: discord.Interaction, nickname: str):
+    async def build():
+        ocid = await get_ocid(nickname)
+        data = await nexon_get("/maplestory/v1/user/union", {"ocid": ocid})
+        e = maple_embed(f"{nickname} 유니온")
+        e.add_field(name="유니온 레벨", value=fmt_num(data.get("union_level")), inline=True)
+        e.add_field(name="등급", value=safe_text(data.get("union_grade")), inline=True)
+        if data.get("union_artifact_level") is not None:
+            e.add_field(name="아티팩트 레벨", value=fmt_num(data.get("union_artifact_level")), inline=True)
+        try:
+            raider = await nexon_get("/maplestory/v1/user/union-raider", {"ocid": ocid})
+            blocks = raider.get("union_block", []) or []
+            if blocks:
+                e.add_field(name="배치된 공격대원", value=f"{len(blocks)}명", inline=True)
+        except MapleAPIError:
+            pass
+        e.set_footer(text=f"기준일: {safe_text(data.get('date'), '최신')} · 넥슨 오픈 API")
+        return e
+
+    await run_maple(interaction, build)
+
+
+async def resolve_oguild_id(guild_name, world_name):
+    data = await nexon_get(
+        "/maplestory/v1/guild/id",
+        {"guild_name": guild_name, "world_name": world_name},
+        ttl=OCID_CACHE_TTL,
+    )
+    oguild = data.get("oguild_id")
+    if not oguild:
+        raise MapleAPIError(f"`{world_name}` 월드에서 `{guild_name}` 길드를 찾을 수 없습니다.")
+    return oguild
+
+
+@bot.tree.command(name="길드", description="길드 정보를 조회합니다. (기본: 우리 길드)")
+@app_commands.rename(guild_name="길드이름", world_name="월드")
+@app_commands.describe(guild_name="조회할 길드 이름 (비우면 우리 길드)", world_name="월드 이름 (비우면 스카니아)")
+async def maple_guild(interaction: discord.Interaction, guild_name: str = None, world_name: str = None):
+    async def build():
+        gname = (guild_name or MAPLE_GUILD_NAME).strip()
+        wname = (world_name or MAPLE_WORLD_NAME).strip()
+        oguild = await resolve_oguild_id(gname, wname)
+        basic = await nexon_get("/maplestory/v1/guild/basic", {"oguild_id": oguild})
+        e = maple_embed(f"{safe_text(basic.get('guild_name'), gname)} ({wname})")
+        e.add_field(name="길드 레벨", value=safe_text(basic.get("guild_level")), inline=True)
+        e.add_field(name="길드원 수", value=f"{safe_text(basic.get('guild_member_count'))}명", inline=True)
+        e.add_field(name="길드 마스터", value=safe_text(basic.get("guild_master_name")), inline=True)
+        e.add_field(name="명성치", value=fmt_num(basic.get("guild_fame_point")), inline=True)
+        e.add_field(name="길드 포인트", value=fmt_num(basic.get("guild_point")), inline=True)
+        skills = basic.get("guild_skill", []) or []
+        if skills:
+            txt = ", ".join(f"{s.get('skill_name')} Lv.{s.get('skill_level')}" for s in skills[:10])
+            e.add_field(name="길드 스킬", value=txt[:1000], inline=False)
+        e.set_footer(text=f"기준일: {safe_text(basic.get('date'), '최신')} · 넥슨 오픈 API")
+        return e
+
+    await run_maple(interaction, build)
+
+
+@bot.tree.command(name="길드랭킹", description="우리 길드의 공식 길드 랭킹 순위를 조회합니다.")
+@app_commands.rename(rank_type="종류")
+@app_commands.describe(rank_type="랭킹 종류")
+@app_commands.choices(rank_type=[
+    app_commands.Choice(name="주간 명성치", value=0),
+    app_commands.Choice(name="플래그 레이스", value=1),
+    app_commands.Choice(name="지하 수로", value=2),
+])
+async def maple_guild_ranking(interaction: discord.Interaction, rank_type: app_commands.Choice[int]):
+    async def build():
+        data = await nexon_get(
+            "/maplestory/v1/ranking/guild",
+            {
+                "date": kst_date_str(1),
+                "world_name": MAPLE_WORLD_NAME,
+                "ranking_type": rank_type.value,
+                "guild_name": MAPLE_GUILD_NAME,
+            },
+        )
+        rows = data.get("ranking", []) or []
+        e = maple_embed(f"{MAPLE_GUILD_NAME} 길드 랭킹 · {rank_type.name}")
+        if not rows:
+            e.description = "해당 종류의 랭킹에 우리 길드 기록이 없습니다."
+        else:
+            for r in rows[:5]:
+                e.add_field(
+                    name=f"{fmt_num(r.get('ranking'))}위 · {safe_text(r.get('guild_name'))}",
+                    value=f"길드 Lv.{safe_text(r.get('guild_level'))} · 마스터 {safe_text(r.get('guild_master_name'))}\n"
+                          f"점수 {fmt_num(r.get('guild_point'))}",
+                    inline=False,
+                )
+        e.set_footer(text=f"기준일: {kst_date_str(1)} · 개인 수로 점수는 공식 API에서 제공하지 않습니다")
+        return e
+
+    await run_maple(interaction, build)
+
+
+# ------------------------------------------
+# 길드원 인증 (메이플핸즈 스크린샷 + 운영진 승인)
+# ------------------------------------------
+def build_verify_buttons(request_id, disabled=False):
+    view = ErrorReportingView(timeout=None)
+    approve = discord.ui.Button(
+        label="승인", style=discord.ButtonStyle.success,
+        custom_id=f"verify_approve:{request_id}", disabled=disabled,
+    )
+    reject = discord.ui.Button(
+        label="거절", style=discord.ButtonStyle.danger,
+        custom_id=f"verify_reject:{request_id}", disabled=disabled,
+    )
+    approve.callback = _noop_button_callback
+    reject.callback = _noop_button_callback
+    view.add_item(approve)
+    view.add_item(reject)
+    return view
+
+
+@bot.tree.command(name="인증", description="길드원 인증을 신청합니다. (메이플핸즈 앱 스크린샷 첨부)")
+@app_commands.rename(nickname="닉네임", screenshot="스크린샷")
+@app_commands.describe(nickname="인증할 본캐릭터 닉네임", screenshot="메이플핸즈 앱 화면 스크린샷")
+async def maple_verify(interaction: discord.Interaction, nickname: str, screenshot: discord.Attachment):
+    if interaction.channel_id != VERIFY_REQUEST_CHANNEL_ID:
+        await interaction.response.send_message(
+            f"❌ 이 명령어는 <#{VERIFY_REQUEST_CHANNEL_ID}> 채널에서만 사용할 수 있어요.", ephemeral=True)
+        return
+    if not (screenshot.content_type or "").startswith("image/"):
+        await interaction.response.send_message("❌ 이미지 파일(스크린샷)을 첨부해주세요.", ephemeral=True)
+        return
+    if not NEXON_API_KEY:
+        await interaction.response.send_message("❌ 아직 넥슨 API 설정이 완료되지 않았어요. 운영진에게 문의해주세요.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        guild = interaction.guild
+        member = interaction.user
+
+        role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME) if guild else None
+        if role is None:
+            raise UserFacingError(f"`{VERIFIED_ROLE_NAME}` 역할을 찾을 수 없습니다. 운영진에게 문의해주세요.")
+        if role in getattr(member, "roles", []):
+            raise UserFacingError("이미 인증이 완료된 상태입니다. (역할이 부여되어 있어요)")
+
+        already = await adb("SELECT character_name FROM maple_verifications WHERE user_id=%s", (member.id,), "one")
+        if already:
+            raise UserFacingError(f"이미 `{already[0]}` 캐릭터로 인증되어 있습니다. 변경이 필요하면 운영진에게 문의해주세요.")
+
+        pending = await adb(
+            "SELECT id FROM maple_verify_requests WHERE user_id=%s AND status='pending'", (member.id,), "one")
+        if pending:
+            raise UserFacingError("이미 접수된 인증 신청이 있습니다. 운영진 확인을 기다려주세요.")
+
+        ocid = await get_ocid(nickname)
+        basic = await nexon_get("/maplestory/v1/character/basic", {"ocid": ocid}, ttl=60)
+        real_name = basic.get("character_name") or nickname
+        if basic.get("world_name") != MAPLE_WORLD_NAME:
+            raise UserFacingError(f"`{real_name}` 캐릭터는 {MAPLE_WORLD_NAME} 월드가 아닙니다. ({safe_text(basic.get('world_name'))})")
+        if basic.get("character_guild_name") != MAPLE_GUILD_NAME:
+            raise UserFacingError(
+                f"`{real_name}` 캐릭터는 `{MAPLE_GUILD_NAME}` 길드 소속으로 확인되지 않아요. "
+                f"(현재 길드: {safe_text(basic.get('character_guild_name'), '없음')})\n"
+                "길드 가입 직후라면 잠시(최대 하루) 뒤에 다시 시도해주세요.")
+
+        dup = await adb("SELECT user_id FROM maple_verifications WHERE ocid=%s", (ocid,), "one")
+        if dup and dup[0] != member.id:
+            raise UserFacingError("이 캐릭터는 이미 다른 디스코드 계정으로 인증되어 있습니다. 문제가 있다면 운영진에게 문의해주세요.")
+        dup_pending = await adb(
+            "SELECT user_id FROM maple_verify_requests WHERE ocid=%s AND status='pending'", (ocid,), "one")
+        if dup_pending:
+            raise UserFacingError("이 캐릭터로 접수된 인증 신청이 이미 있습니다.")
+
+        admin_channel = bot.get_channel(VERIFY_ADMIN_CHANNEL_ID)
+        if admin_channel is None:
+            raise UserFacingError("운영진 승인 채널을 찾을 수 없습니다. 운영진에게 문의해주세요.")
+
+        row = await adb(
+            """
+            INSERT INTO maple_verify_requests (user_id, character_name, ocid, status, created_at)
+            VALUES (%s, %s, %s, 'pending', %s) RETURNING id
+            """,
+            (member.id, real_name, ocid, datetime.now(KST).isoformat()), "one")
+        request_id = row[0]
+
+        # 원본 메시지가 지워져도 남도록 스크린샷을 다시 업로드합니다.
+        file = await screenshot.to_file()
+        embed = maple_embed("🪪 길드원 인증 신청", color=0x3498DB)
+        embed.add_field(name="신청자", value=f"{member.mention} ({member})", inline=False)
+        embed.add_field(name="캐릭터", value=f"**{real_name}** · {safe_text(basic.get('character_class'))} Lv.{safe_text(basic.get('character_level'))}", inline=False)
+        embed.add_field(name="API 확인", value=f"{basic.get('world_name')} · 길드 `{basic.get('character_guild_name')}` ✅", inline=False)
+        embed.set_image(url=f"attachment://{file.filename}")
+        embed.set_footer(text=f"요청 번호 #{request_id}")
+        try:
+            msg = await admin_channel.send(embed=embed, file=file, view=build_verify_buttons(request_id))
+        except Exception:
+            await adb("DELETE FROM maple_verify_requests WHERE id=%s", (request_id,))
+            raise
+        await adb("UPDATE maple_verify_requests SET admin_message_id=%s WHERE id=%s", (msg.id, request_id))
+
+        await interaction.followup.send("✅ 인증 신청이 접수되었어요! 운영진이 스크린샷을 확인하면 역할이 부여됩니다.", ephemeral=True)
+    except UserFacingError as e:
+        await interaction.followup.send(f"❌ {e}", ephemeral=True)
+    except Exception as e:
+        import traceback
+        print(f"[인증 신청 오류] {e!r}")
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ 처리 중 오류가 발생했습니다: `{e}`", ephemeral=True)
+
+
+def _is_verify_admin(member):
+    perms = getattr(member, "guild_permissions", None)
+    return bool(perms and (perms.administrator or perms.manage_roles))
+
+
+async def handle_verify_decision(interaction: discord.Interaction, request_id: int, approve: bool):
+    if not _is_verify_admin(interaction.user):
+        await interaction.response.send_message("❌ 운영진만 처리할 수 있어요.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    new_status = "approved" if approve else "rejected"
+    row = await adb(
+        """
+        UPDATE maple_verify_requests SET status=%s, decided_by=%s, decided_at=%s
+        WHERE id=%s AND status='pending'
+        RETURNING user_id, character_name, ocid
+        """,
+        (new_status, interaction.user.id, datetime.now(KST).isoformat(), request_id), "one")
+    if not row:
+        await interaction.followup.send("이미 처리되었거나 존재하지 않는 요청입니다.", ephemeral=True)
+        return
+    target_id, char_name, ocid = row
+
+    guild = interaction.guild
+    member = guild.get_member(target_id) if guild else None
+    if member is None and guild:
+        try:
+            member = await guild.fetch_member(target_id)
+        except Exception:
+            member = None
+
+    if approve:
+        role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
+        problem = None
+        if member is None:
+            problem = "신청자가 서버에 없습니다."
+        elif role is None:
+            problem = f"`{VERIFIED_ROLE_NAME}` 역할을 찾을 수 없습니다."
+        else:
+            try:
+                await member.add_roles(role, reason=f"메이플 길드원 인증 승인 ({char_name})")
+            except discord.Forbidden:
+                problem = "봇에게 역할 부여 권한이 없습니다. (봇 역할이 `병아리반`보다 위에 있고 '역할 관리' 권한이 필요해요)"
+            except Exception as e:
+                problem = f"역할 부여 실패: {e}"
+        if problem:
+            # 되돌려서 다시 시도할 수 있게 합니다.
+            await adb("UPDATE maple_verify_requests SET status='pending', decided_by=NULL, decided_at=NULL WHERE id=%s", (request_id,))
+            await interaction.followup.send(f"❌ 승인하지 못했어요: {problem}", ephemeral=True)
+            return
+        await adb(
+            """
+            INSERT INTO maple_verifications (user_id, character_name, ocid, verified_at, approved_by)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET character_name=EXCLUDED.character_name,
+                ocid=EXCLUDED.ocid, verified_at=EXCLUDED.verified_at, approved_by=EXCLUDED.approved_by
+            """,
+            (target_id, char_name, ocid, datetime.now(KST).isoformat(), interaction.user.id))
+
+    # 승인 메시지 갱신 (버튼 비활성화)
+    try:
+        embed = interaction.message.embeds[0] if interaction.message.embeds else None
+        if embed:
+            embed.color = 0x2ECC71 if approve else 0xE74C3C
+            embed.add_field(
+                name="처리 결과",
+                value=f"{'✅ 승인' if approve else '❌ 거절'} · {interaction.user.mention}",
+                inline=False)
+        await interaction.message.edit(embed=embed, view=build_verify_buttons(request_id, disabled=True))
+    except Exception as e:
+        print(f"[인증] 승인 메시지 갱신 실패: {e}")
+
+    # 신청 채널에 결과 알림
+    try:
+        ch = bot.get_channel(VERIFY_REQUEST_CHANNEL_ID)
+        if ch:
+            if approve:
+                await ch.send(f"🎉 <@{target_id}> 님, `{char_name}` 캐릭터 인증이 완료되어 **{VERIFIED_ROLE_NAME}** 역할이 부여되었어요!")
+            else:
+                await ch.send(f"<@{target_id}> 님, 인증 신청이 거절되었어요. 스크린샷/닉네임을 확인하고 다시 신청해주세요.")
+    except Exception as e:
+        print(f"[인증] 결과 알림 실패: {e}")
+
+    await interaction.followup.send("처리 완료!", ephemeral=True)
+
+
+@bot.tree.command(name="인증해제", description="[운영진] 길드원 인증 정보를 삭제하고 역할을 회수합니다.")
+@app_commands.rename(target="대상")
+@app_commands.describe(target="인증을 해제할 유저")
+@app_commands.default_permissions(manage_roles=True)
+async def maple_unverify(interaction: discord.Interaction, target: discord.Member):
+    if not _is_verify_admin(interaction.user):
+        await interaction.response.send_message("❌ 운영진만 사용할 수 있어요.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    row = await adb("DELETE FROM maple_verifications WHERE user_id=%s RETURNING character_name", (target.id,), "one")
+    role = discord.utils.get(interaction.guild.roles, name=VERIFIED_ROLE_NAME)
+    removed = False
+    if role and role in target.roles:
+        try:
+            await target.remove_roles(role, reason=f"인증 해제 by {interaction.user}")
+            removed = True
+        except Exception as e:
+            await interaction.followup.send(f"인증 기록은 삭제했지만 역할 회수에 실패했어요: {e}", ephemeral=True)
+            return
+    if not row and not removed:
+        await interaction.followup.send("해당 유저의 인증 기록/역할이 없습니다.", ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"✅ {target.mention} 인증 해제 완료 (기록 {'삭제' if row else '없음'}, 역할 {'회수' if removed else '없음'})", ephemeral=True)
+
+
+async def fetch_guild_member_names():
+    oguild = await resolve_oguild_id(MAPLE_GUILD_NAME, MAPLE_WORLD_NAME)
+    basic = await nexon_get("/maplestory/v1/guild/basic", {"oguild_id": oguild}, ttl=120)
+    return [n for n in (basic.get("guild_member", []) or [])], basic
+
+
+@bot.tree.command(name="미인증길드원", description="[운영진] 길드원 중 아직 디스코드 인증을 하지 않은 캐릭터 목록")
+@app_commands.default_permissions(manage_roles=True)
+async def maple_unverified_members(interaction: discord.Interaction):
+    if not _is_verify_admin(interaction.user):
+        await interaction.response.send_message("❌ 운영진만 사용할 수 있어요.", ephemeral=True)
+        return
+
+    async def build():
+        names, basic = await fetch_guild_member_names()
+        rows = await adb("SELECT character_name FROM maple_verifications", (), "all")
+        verified = {r[0].lower() for r in rows}
+        unverified = [n for n in names if n.lower() not in verified]
+        e = maple_embed(f"미인증 길드원 ({len(unverified)}/{len(names)}명)")
+        if not unverified:
+            e.description = "모든 길드원이 인증을 마쳤어요! 🎉"
+        else:
+            for i, chunk in enumerate(chunk_lines(unverified, 1000)[:6]):
+                e.add_field(name="캐릭터" if i == 0 else "​", value=chunk, inline=False)
+        e.set_footer(text="인증된 캐릭터 닉네임과 길드원 목록을 대조한 결과입니다. (부캐/닉변은 오차가 있을 수 있어요)")
+        return e
+
+    await run_maple(interaction, build, ephemeral=True)
+
+
+@tasks.loop(time=dt_time(hour=4, minute=0, tzinfo=KST))
+async def maple_guild_member_check():
+    """매일 새벽 4시: 인증된 유저 중 길드를 탈퇴했거나 닉네임이 바뀐 사람을 확인합니다."""
+    try:
+        names, _ = await fetch_guild_member_names()
+    except Exception as e:
+        print(f"[길드원 점검] 길드원 목록 조회 실패: {e}")
+        return
+    name_set = {n.lower() for n in names}
+    rows = await adb("SELECT user_id, character_name, ocid FROM maple_verifications", (), "all")
+    left = []
+    for user_id, char_name, ocid in rows:
+        if char_name.lower() in name_set:
+            continue
+        try:
+            basic = await nexon_get("/maplestory/v1/character/basic", {"ocid": ocid}, ttl=60)
+        except Exception as e:
+            print(f"[길드원 점검] {char_name} 조회 실패: {e}")
+            continue
+        new_name = basic.get("character_name") or char_name
+        if basic.get("character_guild_name") == MAPLE_GUILD_NAME:
+            if new_name != char_name:
+                await adb("UPDATE maple_verifications SET character_name=%s WHERE user_id=%s", (new_name, user_id))
+            continue
+        left.append((user_id, new_name, basic.get("character_guild_name")))
+    if left:
+        ch = bot.get_channel(VERIFY_ADMIN_CHANNEL_ID)
+        if ch:
+            lines = [f"<@{u}> · `{n}` → 현재 길드: {g or '없음'}" for u, n, g in left]
+            await ch.send(
+                "⚠️ **길드를 탈퇴한 것으로 보이는 인증 유저**입니다. 확인 후 필요하면 `/인증해제` 해주세요.\n"
+                + "\n".join(lines)[:1800])
+
+
+# ------------------------------------------
+# 공지 알림
+# ------------------------------------------
+NOTICE_SOURCES = [
+    ("notice", "/maplestory/v1/notice", "notice", "📢 공지사항"),
+    ("update", "/maplestory/v1/notice-update", "update_notice", "🛠️ 업데이트"),
+    ("event", "/maplestory/v1/notice-event", "event_notice", "🎉 이벤트"),
+]
+
+
+async def _load_seen(key):
+    row = await adb("SELECT value FROM maple_state WHERE key=%s", (f"notice_seen:{key}",), "one")
+    if not row:
+        return None
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return None
+
+
+async def _save_seen(key, ids):
+    await adb(
+        """
+        INSERT INTO maple_state (key, value) VALUES (%s, %s)
+        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+        """,
+        (f"notice_seen:{key}", json.dumps(ids[-200:])))
+
+
+def pick_new_notices(items, seen):
+    """seen 이 None 이면(첫 실행) 새 글 없음으로 보고 현재 목록만 기록합니다."""
+    ids = [str(i.get("notice_id")) for i in items if i.get("notice_id") is not None]
+    if seen is None:
+        return [], ids
+    seen_set = set(seen)
+    new_items = [i for i in items if str(i.get("notice_id")) not in seen_set]
+    return list(reversed(new_items)), list(dict.fromkeys(seen + ids))
+
+
+@tasks.loop(minutes=10)
+async def maple_notice_check():
+    ch = bot.get_channel(MAPLE_NOTICE_CHANNEL_ID)
+    for key, path, field, label in NOTICE_SOURCES:
+        try:
+            data = await nexon_get(path, ttl=60)
+            items = data.get(field, []) or []
+            seen = await _load_seen(key)
+            new_items, new_seen = pick_new_notices(items, seen)
+            if ch:
+                for it in new_items[:5]:
+                    e = maple_embed(f"{label}: {safe_text(it.get('title'))}", color=0xE67E22)
+                    if it.get("url"):
+                        e.url = it["url"]
+                    if it.get("date"):
+                        e.set_footer(text=str(it["date"])[:10])
+                    if it.get("date_event_start") and it.get("date_event_end"):
+                        e.description = f"기간: {str(it['date_event_start'])[:10]} ~ {str(it['date_event_end'])[:10]}"
+                    await ch.send(embed=e)
+            if new_seen != seen:
+                await _save_seen(key, new_seen)
+        except Exception as e:
+            print(f"[공지 알림:{key}] 오류: {e}")
+
+
+@maple_notice_check.before_loop
+async def _before_maple_notice_check():
+    await bot.wait_until_ready()
+
+
+@maple_guild_member_check.before_loop
+async def _before_maple_guild_member_check():
+    await bot.wait_until_ready()
+
+
+# ------------------------------------------
+# 진단
+# ------------------------------------------
+@bot.tree.command(name="메이플진단", description="[운영진] 넥슨 API 연결 상태와 응답 형식을 점검합니다.")
+@app_commands.rename(nickname="닉네임")
+@app_commands.describe(nickname="점검에 사용할 캐릭터 닉네임 (비우면 캐릭터 항목 생략)")
+@app_commands.default_permissions(administrator=True)
+async def maple_diagnose(interaction: discord.Interaction, nickname: str = None):
+    if not (interaction.user.guild_permissions.administrator):
+        await interaction.response.send_message("❌ 관리자만 사용할 수 있어요.", ephemeral=True)
+        return
+
+    async def build():
+        lines = [f"API 키 설정: {'✅' if NEXON_API_KEY else '❌ (NEXON_API_KEY 없음)'}"]
+        role = discord.utils.get(interaction.guild.roles, name=VERIFIED_ROLE_NAME)
+        lines.append(f"역할 `{VERIFIED_ROLE_NAME}`: {'✅' if role else '❌ 없음'}")
+        me = interaction.guild.me
+        if role and me:
+            lines.append(f"봇이 역할을 줄 수 있음: {'✅' if (me.guild_permissions.manage_roles and me.top_role > role) else '❌ (역할 순서/권한 확인)'}")
+        for label, cid in (("인증 신청", VERIFY_REQUEST_CHANNEL_ID), ("운영진 승인", VERIFY_ADMIN_CHANNEL_ID), ("공지 알림", MAPLE_NOTICE_CHANNEL_ID)):
+            lines.append(f"{label} 채널: {'✅' if bot.get_channel(cid) else '❌ 접근 불가'}")
+
+        async def probe(name, path, params, show_keys=True):
+            try:
+                d = await nexon_get(path, params, ttl=0)
+                keys = ", ".join(list(d.keys())[:8]) if show_keys and isinstance(d, dict) else ""
+                lines.append(f"✅ {name}" + (f" — 키: {keys}" if keys else ""))
+                return d
+            except Exception as e:
+                lines.append(f"❌ {name} — {e}")
+                return None
+
+        if NEXON_API_KEY:
+            oguild = None
+            d = await probe("guild/id", "/maplestory/v1/guild/id", {"guild_name": MAPLE_GUILD_NAME, "world_name": MAPLE_WORLD_NAME})
+            if d:
+                oguild = d.get("oguild_id")
+            if oguild:
+                b = await probe("guild/basic", "/maplestory/v1/guild/basic", {"oguild_id": oguild})
+                if b:
+                    lines.append(f"   길드원 목록 {len(b.get('guild_member', []) or [])}명 / 보고된 인원 {b.get('guild_member_count')}")
+            for rt, rn in ((0, "명성치"), (1, "플래그"), (2, "지하수로")):
+                d = await probe(f"ranking/guild type={rt}({rn})", "/maplestory/v1/ranking/guild",
+                                {"date": kst_date_str(1), "world_name": MAPLE_WORLD_NAME, "ranking_type": rt, "guild_name": MAPLE_GUILD_NAME}, False)
+                if d is not None:
+                    rows = d.get("ranking", []) or []
+                    lines.append(f"   결과 {len(rows)}건" + (f" · 1건 예: {rows[0].get('guild_name')} / {rows[0].get('ranking')}위" if rows else ""))
+            for key, path, field, _ in NOTICE_SOURCES:
+                await probe(f"{key} 공지", path, None, False)
+            if nickname:
+                ocid = None
+                try:
+                    ocid = await get_ocid(nickname)
+                    lines.append("✅ character id")
+                except Exception as e:
+                    lines.append(f"❌ character id — {e}")
+                if ocid:
+                    for name, path in (
+                        ("character/basic", "/maplestory/v1/character/basic"),
+                        ("character/stat", "/maplestory/v1/character/stat"),
+                        ("character/dojang", "/maplestory/v1/character/dojang"),
+                        ("character/item-equipment", "/maplestory/v1/character/item-equipment"),
+                        ("character/symbol-equipment", "/maplestory/v1/character/symbol-equipment"),
+                        ("user/union", "/maplestory/v1/user/union"),
+                    ):
+                        await probe(name, path, {"ocid": ocid})
+        e = maple_embed("메이플 API 진단", "\n".join(lines)[:4000], color=0x95A5A6)
+        return e
+
+    await run_maple(interaction, build, ephemeral=True)
+
+
+def start_maple_background_tasks():
+    """API 키가 있을 때만 메이플 관련 반복 작업을 시작합니다."""
+    if not NEXON_API_KEY:
+        print("[메이플] NEXON_API_KEY 가 없어 공지 알림/길드원 점검을 시작하지 않습니다.")
+        return
+    if not maple_notice_check.is_running():
+        maple_notice_check.start()
+    if not maple_guild_member_check.is_running():
+        maple_guild_member_check.start()
+
+
 # 봇 실행부
 # ------------------------------------------
 TOKEN = os.getenv("DISCORD_TOKEN")
