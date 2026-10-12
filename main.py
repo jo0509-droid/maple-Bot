@@ -1828,9 +1828,7 @@ async def maple_verify(interaction: discord.Interaction, nickname: str, screensh
         if role in getattr(member, "roles", []):
             raise UserFacingError("이미 인증이 완료된 상태입니다. (역할이 부여되어 있어요)")
 
-        already = await adb("SELECT character_name FROM maple_verifications WHERE user_id=%s", (member.id,), "one")
-        if already:
-            raise UserFacingError(f"이미 `{already[0]}` 캐릭터로 인증되어 있습니다. 변경이 필요하면 운영진에게 문의해주세요.")
+        # 예전 인증 기록이 있어도 역할이 없으면(역할 삭제/서버 재입장) 다시 인증할 수 있습니다.
 
         pending = await adb(
             "SELECT id FROM maple_verify_requests WHERE user_id=%s AND status='pending'", (member.id,), "one")
@@ -1850,7 +1848,11 @@ async def maple_verify(interaction: discord.Interaction, nickname: str, screensh
 
         dup = await adb("SELECT user_id FROM maple_verifications WHERE ocid=%s", (ocid,), "one")
         if dup and dup[0] != member.id:
-            raise UserFacingError("이 캐릭터는 이미 다른 디스코드 계정으로 인증되어 있습니다. 문제가 있다면 운영진에게 문의해주세요.")
+            other = guild.get_member(dup[0])
+            other_has_role = bool(other and role in other.roles)
+            if other_has_role:
+                raise UserFacingError("이 캐릭터는 이미 다른 디스코드 계정으로 인증되어 있습니다. 문제가 있다면 운영진에게 문의해주세요.")
+            # 이전 계정이 서버를 나갔거나 역할이 없으면 새 계정으로 재인증을 허용합니다.
         dup_pending = await adb(
             "SELECT user_id FROM maple_verify_requests WHERE ocid=%s AND status='pending'", (ocid,), "one")
         if dup_pending:
@@ -1964,6 +1966,8 @@ async def handle_verify_decision(interaction: discord.Interaction, request_id: i
                 ocid=EXCLUDED.ocid, verified_at=EXCLUDED.verified_at, approved_by=EXCLUDED.approved_by
             """,
             (target_id, char_name, ocid, datetime.now(KST).isoformat(), interaction.user.id))
+        # 같은 캐릭터로 남아있던 다른 계정의 옛 기록 정리
+        await adb("DELETE FROM maple_verifications WHERE ocid=%s AND user_id<>%s", (ocid, target_id))
 
     # 승인 메시지 갱신 (버튼 비활성화)
     try:
