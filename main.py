@@ -1023,10 +1023,18 @@ async def attendance_admin(interaction: discord.Interaction, action: str, user: 
         await interaction.response.send_message(f"✅ {user.mention}님의 누적 출석일수가 **{amount}일**로 수정되었습니다.", ephemeral=True)
 
 DAILY_FORTUNE_LIMIT = 1
+FORTUNE_CHANNEL_ID = 1559161778313625721  # /포춘쿠키를 사용할 수 있는 채널
 FORTUNE_PIECE_CHANCE = 20  # %
 
 @bot.tree.command(name="포춘쿠키", description="오늘의 행운의 포춘쿠키를 뽑고 행복한 문구를 확인합니다. (하루 1회)")
 async def fortune_cookie(interaction: discord.Interaction):
+    # 지정된 채널에서만 사용 가능 (다른 채널에서는 사용 횟수도 차감하지 않고 안내만 보냅니다)
+    if interaction.channel_id != FORTUNE_CHANNEL_ID:
+        await interaction.response.send_message(
+            f"🥠 포춘쿠키는 <#{FORTUNE_CHANNEL_ID}> 채널에서만 사용할 수 있어요!", ephemeral=True
+        )
+        return
+
     user_id = interaction.user.id
     today_str = datetime.now(KST).strftime("%Y-%m-%d")
 
