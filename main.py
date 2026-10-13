@@ -1841,11 +1841,7 @@ async def maple_verify(interaction: discord.Interaction, nickname: str, screensh
         real_name = basic.get("character_name") or nickname
         if basic.get("world_name") != MAPLE_WORLD_NAME:
             raise UserFacingError(f"`{real_name}` 캐릭터는 {MAPLE_WORLD_NAME} 월드가 아닙니다. ({safe_text(basic.get('world_name'))})")
-        if basic.get("character_guild_name") != MAPLE_GUILD_NAME:
-            raise UserFacingError(
-                f"`{real_name}` 캐릭터는 `{MAPLE_GUILD_NAME}` 길드 소속으로 확인되지 않아요. "
-                f"(현재 길드: {safe_text(basic.get('character_guild_name'), '없음')})\n"
-                "길드 가입 직후라면 잠시(최대 하루) 뒤에 다시 시도해주세요.")
+        # 길드 가입 전 신규 인원도 인증할 수 있도록 길드 소속은 요구하지 않습니다. (월드와 실존 캐릭터만 확인)
 
         dup = await adb("SELECT user_id FROM maple_verifications WHERE ocid=%s", (ocid,), "one")
         if dup and dup[0] != member.id:
@@ -1876,7 +1872,12 @@ async def maple_verify(interaction: discord.Interaction, nickname: str, screensh
         embed = maple_embed("🪪 길드원 인증 신청", color=0x3498DB)
         embed.add_field(name="신청자", value=f"{member.mention} ({member})", inline=False)
         embed.add_field(name="캐릭터", value=f"**{real_name}** · {safe_text(basic.get('character_class'))} Lv.{safe_text(basic.get('character_level'))}", inline=False)
-        embed.add_field(name="API 확인", value=f"{basic.get('world_name')} · 길드 `{basic.get('character_guild_name')}` ✅", inline=False)
+        in_guild = basic.get("character_guild_name") == MAPLE_GUILD_NAME
+        embed.add_field(
+            name="API 확인",
+            value=f"{basic.get('world_name')} · 길드 `{safe_text(basic.get('character_guild_name'), '없음')}` "
+                  + ("✅ (우리 길드)" if in_guild else "⚠️ (아직 우리 길드원이 아님)"),
+            inline=False)
         embed.set_image(url=f"attachment://{file.filename}")
         embed.set_footer(text=f"요청 번호 #{request_id}")
         try:
@@ -2064,36 +2065,18 @@ async def maple_unverified_members(interaction: discord.Interaction):
 
 @tasks.loop(time=dt_time(hour=4, minute=0, tzinfo=KST))
 async def maple_guild_member_check():
-    """매일 새벽 4시: 인증된 유저 중 길드를 탈퇴했거나 닉네임이 바뀐 사람을 확인합니다."""
-    try:
-        names, _ = await fetch_guild_member_names()
-    except Exception as e:
-        print(f"[길드원 점검] 길드원 목록 조회 실패: {e}")
-        return
-    name_set = {n.lower() for n in names}
+    """매일 새벽 4시: 인증된 유저의 닉네임 변경을 기록에 반영합니다. (탈퇴 알림은 가입/탈퇴 알림에서 처리)"""
     rows = await adb("SELECT user_id, character_name, ocid FROM maple_verifications", (), "all")
-    left = []
     for user_id, char_name, ocid in rows:
-        if char_name.lower() in name_set:
-            continue
         try:
             basic = await nexon_get("/maplestory/v1/character/basic", {"ocid": ocid}, ttl=60)
         except Exception as e:
-            print(f"[길드원 점검] {char_name} 조회 실패: {e}")
+            print(f"[닉네임 점검] {char_name} 조회 실패: {e}")
             continue
         new_name = basic.get("character_name") or char_name
-        if basic.get("character_guild_name") == MAPLE_GUILD_NAME:
-            if new_name != char_name:
-                await adb("UPDATE maple_verifications SET character_name=%s WHERE user_id=%s", (new_name, user_id))
-            continue
-        left.append((user_id, new_name, basic.get("character_guild_name")))
-    if left:
-        ch = bot.get_channel(VERIFY_ADMIN_CHANNEL_ID)
-        if ch:
-            lines = [f"<@{u}> · `{n}` → 현재 길드: {g or '없음'}" for u, n, g in left]
-            await ch.send(
-                "⚠️ **길드를 탈퇴한 것으로 보이는 인증 유저**입니다. 확인 후 필요하면 `/인증해제` 해주세요.\n"
-                + "\n".join(lines)[:1800])
+        if new_name != char_name:
+            await adb("UPDATE maple_verifications SET character_name=%s WHERE user_id=%s", (new_name, user_id))
+        await asyncio.sleep(0.2)
 
 
 # ------------------------------------------
@@ -2333,9 +2316,12 @@ async def take_all_snapshots():
     return ok, fail
 
 
-@tasks.loop(time=dt_time(hour=4, minute=30, tzinfo=KST))
+SNAPSHOT_INTERVAL_MINUTES = 10   # 성장 기록 갱신 주기 (넥슨 API 호출량이 걱정되면 이 숫자를 늘리세요)
+
+
+@tasks.loop(minutes=SNAPSHOT_INTERVAL_MINUTES)
 async def maple_daily_snapshot():
-    """매일 04:30(KST): 인증된 길드원의 레벨/경험치/전투력/유니온을 기록합니다."""
+    """주기적으로 인증된 길드원의 레벨/경험치/전투력/유니온을 기록합니다. (같은 날 기록은 최신 값으로 덮어씀)"""
     await take_all_snapshots()
 
 
@@ -2384,16 +2370,16 @@ async def maple_growth(interaction: discord.Interaction, days: app_commands.Choi
                                   else "해당 유저는 인증된 캐릭터가 없어요.")
         first, last = await load_window(user.id, period)
         if not last:
-            raise UserFacingError("아직 성장 기록이 없어요. 기록은 매일 새벽 4시 30분에 저장되니 내일부터 확인할 수 있어요.")
+            raise UserFacingError("아직 성장 기록이 없어요. 기록은 10분마다 저장되니 잠시 뒤 다시 확인해주세요.")
         if first[0] == last[0]:
-            raise UserFacingError(f"비교할 기록이 하루치뿐이에요. (기록 시작일: {last[0]}) 내일부터 변화량이 표시돼요.")
+            raise UserFacingError(f"비교할 기록이 하루치뿐이에요. (기록 시작일: {last[0]}) 내일부터 날짜별 변화량이 표시돼요.")
         e = maple_embed(f"📈 {last[1]} 성장 기록 ({first[0]} → {last[0]})")
         e.add_field(name="레벨", value=_delta_text(last[2], first[2]), inline=True)
         if last[3] is not None and first[3] is not None and last[2] == first[2]:
             e.add_field(name="경험치 증가량", value=fmt_num(last[3] - first[3]), inline=True)
         e.add_field(name="전투력", value=_delta_text(last[4], first[4], big=True), inline=False)
         e.add_field(name="유니온 레벨", value=_delta_text(last[5], first[5]), inline=True)
-        e.set_footer(text="매일 새벽 4시 30분 기준 기록 · 넥슨 오픈 API")
+        e.set_footer(text="10분마다 갱신 · 넥슨 오픈 API (약 15분 지연)")
         return e
 
     await run_maple(interaction, build)
@@ -2461,7 +2447,7 @@ async def build_growth_ranking_embed(metric, period, top=10):
     e = maple_embed(f"🏆 성장 랭킹 · {METRIC_LABEL[metric]} · 최근 {period}일", color=0xF1C40F)
     shown = [r for r in results if r[4] > 0][:top]
     if not shown:
-        e.description = "비교할 수 있는 기록이 아직 부족하거나 증가한 사람이 없어요. (기록은 매일 새벽 4시 30분에 저장돼요)"
+        e.description = "비교할 수 있는 기록이 아직 부족하거나 증가한 사람이 없어요. (기록은 10분마다 저장돼요)"
         return e
     medals = ["🥇", "🥈", "🥉"]
     lines = []
@@ -2532,6 +2518,28 @@ def diff_members(old_names, new_names):
     return sorted(joined), sorted(left)
 
 
+async def alert_verified_left(left_names):
+    """길드원 목록에서 빠진 캐릭터 중 인증된 유저가 있고 실제로 길드를 떠났다면 운영진 채널에 알립니다."""
+    rows = await adb("SELECT user_id, character_name, ocid FROM maple_verifications", (), "all")
+    left_set = {n.lower() for n in left_names}
+    alerts = []
+    for user_id, char_name, ocid in rows:
+        if char_name.lower() not in left_set:
+            continue
+        try:
+            basic = await nexon_get("/maplestory/v1/character/basic", {"ocid": ocid}, ttl=0)
+        except Exception:
+            continue
+        new_name = basic.get("character_name") or char_name
+        if new_name != char_name:
+            await adb("UPDATE maple_verifications SET character_name=%s WHERE user_id=%s", (new_name, user_id))
+        if basic.get("character_guild_name") != MAPLE_GUILD_NAME:
+            alerts.append(f"<@{user_id}> · `{new_name}` → 현재 길드: {safe_text(basic.get('character_guild_name'), '없음')}")
+    ch = bot.get_channel(VERIFY_ADMIN_CHANNEL_ID)
+    if alerts and ch:
+        await ch.send("⚠️ **길드를 탈퇴한 것으로 보이는 인증 유저**입니다. 확인 후 필요하면 `/인증해제` 해주세요.\n" + "\n".join(alerts)[:1800])
+
+
 @tasks.loop(minutes=30)
 async def maple_member_change_check():
     """30분마다 길드원 목록을 비교해 가입/탈퇴(닉네임 변경 포함)를 알립니다. 첫 실행은 기록만 합니다."""
@@ -2552,6 +2560,8 @@ async def maple_member_change_check():
                     e.add_field(name=f"➖ 탈퇴/닉네임 변경 ({len(left)})", value="\n".join(left)[:1000], inline=False)
                 e.set_footer(text=f"현재 길드원 {len(names)}명 · 닉네임을 바꾼 경우 탈퇴+가입으로 함께 표시될 수 있어요")
                 await ch.send(embed=e)
+            if left:
+                await alert_verified_left(left)
         await adb(
             """
             INSERT INTO maple_state (key, value) VALUES (%s, %s)
