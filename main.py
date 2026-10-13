@@ -2509,6 +2509,165 @@ async def maple_probability(interaction: discord.Interaction):
     await interaction.response.send_message(embed=e)
 
 
+# ------------------------------------------
+# 길드원 가입/탈퇴 알림
+# ------------------------------------------
+MEMBER_CHANGE_CHANNEL_ID = MAPLE_NOTICE_CHANNEL_ID   # 가입/탈퇴 알림 채널 (바꾸려면 여기 ID만 수정)
+
+
+def diff_members(old_names, new_names):
+    old_map = {n.lower(): n for n in old_names}
+    new_map = {n.lower(): n for n in new_names}
+    joined = [new_map[k] for k in new_map if k not in old_map]
+    left = [old_map[k] for k in old_map if k not in new_map]
+    return sorted(joined), sorted(left)
+
+
+@tasks.loop(minutes=30)
+async def maple_member_change_check():
+    """30분마다 길드원 목록을 비교해 가입/탈퇴(닉네임 변경 포함)를 알립니다. 첫 실행은 기록만 합니다."""
+    try:
+        names, _ = await fetch_guild_member_names()
+        if not names:
+            return
+        row = await adb("SELECT value FROM maple_state WHERE key=%s", ("guild_members",), "one")
+        if row:
+            old = json.loads(row[0])
+            joined, left = diff_members(old, names)
+            ch = bot.get_channel(MEMBER_CHANGE_CHANNEL_ID)
+            if ch and (joined or left):
+                e = maple_embed(f"👥 {MAPLE_GUILD_NAME} 길드원 변동", color=0x1ABC9C)
+                if joined:
+                    e.add_field(name=f"➕ 가입 ({len(joined)})", value="\n".join(joined)[:1000], inline=False)
+                if left:
+                    e.add_field(name=f"➖ 탈퇴/닉네임 변경 ({len(left)})", value="\n".join(left)[:1000], inline=False)
+                e.set_footer(text=f"현재 길드원 {len(names)}명 · 닉네임을 바꾼 경우 탈퇴+가입으로 함께 표시될 수 있어요")
+                await ch.send(embed=e)
+        await adb(
+            """
+            INSERT INTO maple_state (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+            """,
+            ("guild_members", json.dumps(names, ensure_ascii=False)))
+    except Exception as e:
+        print(f"[길드원 변동 알림] 오류: {e}")
+
+
+@maple_member_change_check.before_loop
+async def _before_maple_member_change_check():
+    await bot.wait_until_ready()
+
+
+# ------------------------------------------
+# 기존 수동 인증자 등록 (운영진용)
+# ------------------------------------------
+async def register_verification(user_id, char_name, ocid, admin_id):
+    await adb(
+        """
+        INSERT INTO maple_verifications (user_id, character_name, ocid, verified_at, approved_by)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET character_name=EXCLUDED.character_name,
+            ocid=EXCLUDED.ocid, verified_at=EXCLUDED.verified_at, approved_by=EXCLUDED.approved_by
+        """,
+        (user_id, char_name, ocid, datetime.now(KST).isoformat(), admin_id))
+
+
+@bot.tree.command(name="수동인증", description="[운영진] 유저를 캐릭터 닉네임으로 인증 기록만 등록합니다. (역할 변경 없음)")
+@app_commands.rename(target="대상", nickname="닉네임")
+@app_commands.describe(target="인증할 유저", nickname="그 유저의 본캐릭터 닉네임")
+@app_commands.default_permissions(manage_roles=True)
+async def maple_manual_verify(interaction: discord.Interaction, target: discord.Member, nickname: str):
+    if not _is_verify_admin(interaction.user):
+        await interaction.response.send_message("❌ 운영진만 사용할 수 있어요.", ephemeral=True)
+        return
+
+    async def build():
+        ocid = await get_ocid(nickname)
+        basic = await nexon_get("/maplestory/v1/character/basic", {"ocid": ocid}, ttl=60)
+        real_name = basic.get("character_name") or nickname
+        dup = await adb("SELECT user_id FROM maple_verifications WHERE ocid=%s", (ocid,), "one")
+        if dup and dup[0] != target.id:
+            raise UserFacingError(f"`{real_name}` 캐릭터는 이미 <@{dup[0]}> 님으로 등록되어 있어요. 먼저 `/인증해제`를 해주세요.")
+        await register_verification(target.id, real_name, ocid, interaction.user.id)
+
+        notes = []
+        guild_name = basic.get("character_guild_name")
+        if guild_name != MAPLE_GUILD_NAME:
+            notes.append(f"⚠️ 이 캐릭터의 현재 길드는 `{safe_text(guild_name, '없음')}` 입니다")
+        return f"✅ {target.mention} → **{real_name}** 인증 등록 완료" + (("\n" + " · ".join(notes)) if notes else "")
+
+    await run_maple(interaction, build, ephemeral=True)
+
+
+@bot.tree.command(name="일괄인증", description="[운영진] 병아리반 역할이 있는 기존 인증자를 디스코드 닉네임으로 자동 등록합니다.")
+@app_commands.rename(execute="실행", scope_role="대상역할")
+@app_commands.describe(execute="True로 하면 실제로 등록, 기본(False)은 미리보기만",
+                       scope_role="이 역할을 가진 사람만 검사 (비우면 병아리반, @everyone을 고르면 서버 전체)")
+@app_commands.default_permissions(manage_roles=True)
+async def maple_bulk_verify(interaction: discord.Interaction, execute: bool = False, scope_role: discord.Role = None):
+    if not _is_verify_admin(interaction.user):
+        await interaction.response.send_message("❌ 운영진만 사용할 수 있어요.", ephemeral=True)
+        return
+
+    async def build():
+        role = discord.utils.get(interaction.guild.roles, name=VERIFIED_ROLE_NAME)
+        if role is None:
+            raise UserFacingError(f"`{VERIFIED_ROLE_NAME}` 역할을 찾을 수 없어요.")
+        names, _ = await fetch_guild_member_names()
+        name_map = {n.lower(): n for n in names}
+        rows = await adb("SELECT user_id, ocid FROM maple_verifications", (), "all")
+        registered_users = {r[0] for r in rows}
+        registered_ocids = {r[1] for r in rows}
+
+        scan_role = scope_role or role
+        targets = [m for m in scan_role.members if not m.bot and m.id not in registered_users]
+        matched, unmatched, skipped = [], [], []
+        for m in targets:
+            cand = None
+            for c in (m.display_name, m.name, getattr(m, "global_name", None)):
+                if c and c.strip().lower() in name_map:
+                    cand = name_map[c.strip().lower()]
+                    break
+            (matched if cand else unmatched).append((m, cand))
+
+        done = 0
+        if execute:
+            for m, cand in matched:
+                try:
+                    ocid = await get_ocid(cand)
+                    if ocid in registered_ocids:
+                        skipped.append((m, f"`{cand}` 는 이미 다른 유저로 등록됨"))
+                        continue
+                    await register_verification(m.id, cand, ocid, interaction.user.id)
+                    registered_ocids.add(ocid)
+                    done += 1
+                except Exception as e:
+                    skipped.append((m, f"`{cand}` 처리 실패: {e}"))
+                await asyncio.sleep(0.2)
+
+        e = maple_embed(("✅ 일괄 인증 결과" if execute else "🔍 일괄 인증 미리보기"), color=0x2ECC71 if execute else 0x95A5A6)
+        e.description = (
+            f"{scan_role.name} 역할 보유 중 미등록: **{len(targets)}명**\n"
+            f"닉네임이 길드원 캐릭터와 일치: **{len(matched)}명**"
+            + (f" → 등록 완료 **{done}명**" if execute else " (실행하려면 `/일괄인증 실행:True`)")
+            + f"\n일치하지 않음: **{len(unmatched)}명**"
+        )
+        if matched and not execute:
+            lines = [f"{m.mention} → {c}" for m, c in matched]
+            for i, chunk in enumerate(chunk_lines(lines, 1000)[:3]):
+                e.add_field(name="등록 예정" if i == 0 else "​", value=chunk, inline=False)
+        if unmatched:
+            lines = [f"{m.mention} (`{m.display_name}`)" for m, _ in unmatched]
+            for i, chunk in enumerate(chunk_lines(lines, 1000)[:3]):
+                e.add_field(name="수동 처리 필요 (`/수동인증`)" if i == 0 else "​", value=chunk, inline=False)
+        if skipped:
+            lines = [f"{m.mention} — {why}" for m, why in skipped]
+            e.add_field(name="건너뜀", value="\n".join(lines)[:1000], inline=False)
+        return e
+
+    await run_maple(interaction, build, ephemeral=True)
+
+
 def start_maple_background_tasks():
     """API 키가 있을 때만 메이플 관련 반복 작업을 시작합니다."""
     if not NEXON_API_KEY:
@@ -2518,6 +2677,8 @@ def start_maple_background_tasks():
         maple_notice_check.start()
     if not maple_guild_member_check.is_running():
         maple_guild_member_check.start()
+    if not maple_member_change_check.is_running():
+        maple_member_change_check.start()
     if not maple_daily_snapshot.is_running():
         maple_daily_snapshot.start()
     if not maple_weekly_growth_post.is_running():
