@@ -1271,6 +1271,9 @@ MAPLE_NOTICE_CHANNEL_ID = 1559168922194804807     # 공지 알림 채널
 
 _nexon_session = None
 _nexon_semaphore = asyncio.Semaphore(4)
+NEXON_MIN_INTERVAL = 0.25   # 모든 넥슨 API 호출 사이 최소 간격(초) → 초당 최대 4회
+_nexon_rate_lock = asyncio.Lock()
+_nexon_last_call = 0.0
 _nexon_cache = {}       # key -> (만료 시각, 데이터)
 NEXON_CACHE_TTL = 300   # 초
 OCID_CACHE_TTL = 3600
@@ -1291,7 +1294,7 @@ NEXON_ERROR_MESSAGES = {
     "OPENAPI00004": "요청 파라미터가 올바르지 않습니다.",
     "OPENAPI00005": "넥슨 API 키가 올바르지 않습니다. (관리자에게 문의해주세요)",
     "OPENAPI00006": "지원하지 않는 API 경로입니다.",
-    "OPENAPI00007": "요청이 너무 많습니다. 잠시 후 다시 시도해주세요.",
+    "OPENAPI00007": "넥슨 API 요청 한도에 걸렸습니다. 잠시 후 다시 시도해주세요. (계속되면 운영진에게 알려주세요)",
     "OPENAPI00009": "아직 해당 데이터가 준비되지 않았습니다. (매일 오전 2시 이후 전일 데이터 제공)",
     "OPENAPI00010": "게임 점검 중입니다.",
     "OPENAPI00011": "넥슨 API 점검 중입니다.",
@@ -1320,10 +1323,17 @@ async def nexon_get(path, params=None, ttl=NEXON_CACHE_TTL):
     if hit and hit[0] > now:
         return hit[1]
 
+    global _nexon_last_call
     last_err = None
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             async with _nexon_semaphore:
+                # 전체 호출 속도를 일정하게 유지 (초당 호출 제한 방지)
+                async with _nexon_rate_lock:
+                    wait = NEXON_MIN_INTERVAL - (time.monotonic() - _nexon_last_call)
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    _nexon_last_call = time.monotonic()
                 session = await _get_nexon_session()
                 async with session.get(NEXON_BASE_URL + path, params=params) as resp:
                     try:
@@ -1352,8 +1362,9 @@ async def nexon_get(path, params=None, ttl=NEXON_CACHE_TTL):
         code = err.get("name") or ""
         msg = NEXON_ERROR_MESSAGES.get(code)
         if code == "OPENAPI00007" or status == 429:
+            print(f"[넥슨 API] 요청 제한 응답(429/OPENAPI00007) path={path} attempt={attempt + 1}")
             last_err = MapleAPIError(NEXON_ERROR_MESSAGES["OPENAPI00007"])
-            await asyncio.sleep(1.5 * (attempt + 1))
+            await asyncio.sleep(2 * (attempt + 1))
             continue
         if code in ("OPENAPI00001",) or status >= 500:
             last_err = MapleAPIError(msg or "넥슨 서버 오류입니다. 잠시 후 다시 시도해주세요.")
@@ -2316,7 +2327,7 @@ async def take_all_snapshots():
     return ok, fail
 
 
-SNAPSHOT_INTERVAL_MINUTES = 10   # 성장 기록 갱신 주기 (넥슨 API 호출량이 걱정되면 이 숫자를 늘리세요)
+SNAPSHOT_INTERVAL_MINUTES = 60   # 전체 길드원 성장 기록 갱신 주기 (/성장 은 호출 시점에 해당 유저를 즉시 최신화합니다)
 
 
 @tasks.loop(minutes=SNAPSHOT_INTERVAL_MINUTES)
@@ -2364,13 +2375,19 @@ async def maple_growth(interaction: discord.Interaction, days: app_commands.Choi
     user = target or interaction.user
 
     async def build():
-        row = await adb("SELECT character_name FROM maple_verifications WHERE user_id=%s", (user.id,), "one")
+        row = await adb("SELECT character_name, ocid FROM maple_verifications WHERE user_id=%s", (user.id,), "one")
+        if row:
+            # 조회하는 순간 해당 유저의 최신 상태를 먼저 저장합니다 (호출량 최소화 + 실시간에 가깝게)
+            try:
+                await take_snapshot_for(user.id, row[0], row[1], kst_date_str(0))
+            except Exception as ex:
+                print(f"[성장] 즉시 갱신 실패: {ex}")
         if not row:
             raise UserFacingError("인증된 캐릭터가 없어요. `/인증`으로 먼저 인증을 받아주세요." if user.id == interaction.user.id
                                   else "해당 유저는 인증된 캐릭터가 없어요.")
         first, last = await load_window(user.id, period)
         if not last:
-            raise UserFacingError("아직 성장 기록이 없어요. 기록은 10분마다 저장되니 잠시 뒤 다시 확인해주세요.")
+            raise UserFacingError("아직 성장 기록이 없어요. 잠시 뒤 다시 시도해주세요.")
         if first[0] == last[0]:
             raise UserFacingError(f"비교할 기록이 하루치뿐이에요. (기록 시작일: {last[0]}) 내일부터 날짜별 변화량이 표시돼요.")
         e = maple_embed(f"📈 {last[1]} 성장 기록 ({first[0]} → {last[0]})")
@@ -2379,7 +2396,7 @@ async def maple_growth(interaction: discord.Interaction, days: app_commands.Choi
             e.add_field(name="경험치 증가량", value=fmt_num(last[3] - first[3]), inline=True)
         e.add_field(name="전투력", value=_delta_text(last[4], first[4], big=True), inline=False)
         e.add_field(name="유니온 레벨", value=_delta_text(last[5], first[5]), inline=True)
-        e.set_footer(text="10분마다 갱신 · 넥슨 오픈 API (약 15분 지연)")
+        e.set_footer(text="조회 시점 기준 최신 · 넥슨 오픈 API (약 15분 지연)")
         return e
 
     await run_maple(interaction, build)
@@ -2447,7 +2464,7 @@ async def build_growth_ranking_embed(metric, period, top=10):
     e = maple_embed(f"🏆 성장 랭킹 · {METRIC_LABEL[metric]} · 최근 {period}일", color=0xF1C40F)
     shown = [r for r in results if r[4] > 0][:top]
     if not shown:
-        e.description = "비교할 수 있는 기록이 아직 부족하거나 증가한 사람이 없어요. (기록은 10분마다 저장돼요)"
+        e.description = "비교할 수 있는 기록이 아직 부족하거나 증가한 사람이 없어요. (기록은 1시간마다 저장돼요)"
         return e
     medals = ["🥇", "🥈", "🥉"]
     lines = []
