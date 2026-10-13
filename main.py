@@ -1928,6 +1928,7 @@ async def handle_verify_decision(interaction: discord.Interaction, request_id: i
         except Exception:
             member = None
 
+    nick_note = ""
     if approve:
         role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
         problem = None
@@ -1967,6 +1968,14 @@ async def handle_verify_decision(interaction: discord.Interaction, request_id: i
                 ocid=EXCLUDED.ocid, verified_at=EXCLUDED.verified_at, approved_by=EXCLUDED.approved_by
             """,
             (target_id, char_name, ocid, datetime.now(KST).isoformat(), interaction.user.id))
+        # 디스코드 서버 닉네임을 캐릭터 닉네임으로 변경 (실패해도 승인은 유지)
+        try:
+            if member.nick != char_name:
+                await member.edit(nick=char_name[:32], reason=f"메이플 길드원 인증 승인 ({char_name})")
+        except discord.Forbidden:
+            nick_note = f"\n⚠️ 닉네임 변경 권한이 없어요 (서버장이거나 봇보다 높은 역할). `{char_name}` 으로 직접 바꿔주세요."
+        except Exception as e:
+            nick_note = f"\n⚠️ 닉네임 변경 실패: {e}"
         # 같은 캐릭터로 남아있던 다른 계정의 옛 기록 정리
         await adb("DELETE FROM maple_verifications WHERE ocid=%s AND user_id<>%s", (ocid, target_id))
 
@@ -1994,7 +2003,7 @@ async def handle_verify_decision(interaction: discord.Interaction, request_id: i
     except Exception as e:
         print(f"[인증] 결과 알림 실패: {e}")
 
-    await interaction.followup.send("처리 완료!", ephemeral=True)
+    await interaction.followup.send("처리 완료!" + nick_note, ephemeral=True)
 
 
 @bot.tree.command(name="인증해제", description="[운영진] 길드원 인증 정보를 삭제하고 역할을 회수합니다.")
@@ -2666,6 +2675,47 @@ async def maple_bulk_verify(interaction: discord.Interaction, execute: bool = Fa
         return e
 
     await run_maple(interaction, build, ephemeral=True)
+
+
+# ------------------------------------------
+# 신규 입장자 인증 안내
+# ------------------------------------------
+GUILD_ID_FOR_COMMANDS = 1498077956839313559
+_verify_cmd_mention_cache = {"value": None}
+
+
+async def get_verify_command_mention():
+    """클릭하면 /인증 입력창이 열리는 명령어 멘션(</인증:ID>)을 만듭니다. 실패하면 일반 텍스트."""
+    if _verify_cmd_mention_cache["value"]:
+        return _verify_cmd_mention_cache["value"]
+    try:
+        cmds = await bot.tree.fetch_commands(guild=discord.Object(id=GUILD_ID_FOR_COMMANDS))
+        for c in cmds:
+            if c.name == "인증":
+                _verify_cmd_mention_cache["value"] = c.mention
+                return c.mention
+    except Exception as e:
+        print(f"[인증 안내] 명령어 멘션 조회 실패: {e}")
+    return "`/인증`"
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    if member.bot or member.guild.id != GUILD_ID_FOR_COMMANDS:
+        return
+    ch = member.guild.get_channel(VERIFY_REQUEST_CHANNEL_ID)
+    if ch is None:
+        return
+    try:
+        cmd = await get_verify_command_mention()
+        await ch.send(
+            f"{member.mention} 님 환영합니다! 🎉\n"
+            f"인증 채널에서 {cmd} << 버튼 누른후 길드에 가입하실 본캐 닉네임과 "
+            f"메이플핸즈(전체서버), 모든캐릭터 전부다 찍어서 스크린샷 첨부해서 보내주시면 됩니다.",
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+    except Exception as e:
+        print(f"[인증 안내] 전송 실패: {e}")
 
 
 def start_maple_background_tasks():
