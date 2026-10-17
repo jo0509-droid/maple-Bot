@@ -71,6 +71,27 @@ def init_attendance_db():
     # 이미 테이블이 만들어져 있는 경우를 위한 컬럼 추가 (있으면 건너뜀 - 데이터 유지됨)
     cursor.execute("ALTER TABLE activity_users ADD COLUMN IF NOT EXISTS daily_exp INTEGER DEFAULT 0")
     cursor.execute("ALTER TABLE activity_users ADD COLUMN IF NOT EXISTS daily_date TEXT")
+    # 솔 에르다 조각 교환 신청
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS piece_exchange_requests (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            amount INTEGER NOT NULL,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT,
+            request_channel_id BIGINT,
+            admin_message_id BIGINT,
+            decided_by BIGINT,
+            decided_at TEXT
+        )
+        """
+    )
+    # 한 유저당 대기 중인 신청은 1건만 허용 (동시에 두 번 신청하는 것 방지)
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uniq_pending_exchange "
+        "ON piece_exchange_requests (user_id) WHERE status = 'pending'"
+    )
     conn.commit()
     cursor.close()
     conn.close()
@@ -462,6 +483,13 @@ async def on_interaction(interaction: discord.Interaction):
             except (IndexError, ValueError):
                 return
             await handle_verify_decision(interaction, request_id, custom_id.startswith("verify_approve:"))
+
+        elif custom_id.startswith("exchange_done:") or custom_id.startswith("exchange_reject:"):
+            try:
+                request_id = int(custom_id.split(":", 1)[1])
+            except (IndexError, ValueError):
+                return
+            await handle_exchange_decision(interaction, request_id, custom_id.startswith("exchange_done:"))
     except Exception as e:
         import traceback
         print(f"[구매/거래끝내기 처리 오류] custom_id={custom_id} error={e!r}")
@@ -2760,6 +2788,188 @@ def start_maple_background_tasks():
         maple_daily_snapshot.start()
     if not maple_weekly_growth_post.is_running():
         maple_weekly_growth_post.start()
+
+
+# ------------------------------------------
+# 솔 에르다 조각 교환 (/조각 교환)
+# ------------------------------------------
+EXCHANGE_ADMIN_CHANNEL_ID = 1560971791231357030  # 교환 알림을 받을 채널
+EXCHANGE_NOTIFY_USER_ID = None  # 알림 때 멘션할 내 디스코드 ID (예: 123456789012345678). None이면 멘션 안 함
+
+piece_group = app_commands.Group(name="조각", description="솔 에르다 조각 관련 명령어")
+
+
+def build_exchange_buttons(request_id, disabled=False):
+    view = ErrorReportingView(timeout=None)
+    done = discord.ui.Button(label="지급 완료", style=discord.ButtonStyle.success,
+                             custom_id=f"exchange_done:{request_id}", disabled=disabled)
+    reject = discord.ui.Button(label="거절", style=discord.ButtonStyle.danger,
+                               custom_id=f"exchange_reject:{request_id}", disabled=disabled)
+    done.callback = _noop_button_callback
+    reject.callback = _noop_button_callback
+    view.add_item(done)
+    view.add_item(reject)
+    return view
+
+
+@piece_group.command(name="교환", description="솔 에르다 조각을 인게임 지급으로 교환 신청합니다.")
+@app_commands.rename(amount="개수")
+@app_commands.describe(amount="교환할 조각 개수")
+async def piece_exchange(interaction: discord.Interaction, amount: app_commands.Range[int, 1]):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        user = interaction.user
+
+        row = await adb("SELECT COALESCE(sol_erda_pieces, 0) FROM attendance_users WHERE user_id=%s", (user.id,), "one")
+        pieces = row[0] if row else 0
+        if amount > pieces:
+            raise UserFacingError(f"보유한 조각이 부족해요. (보유 {pieces}개 / 신청 {amount}개)")
+
+        pending = await adb(
+            "SELECT id, amount FROM piece_exchange_requests WHERE user_id=%s AND status='pending'", (user.id,), "one")
+        if pending:
+            raise UserFacingError(f"이미 처리 대기 중인 교환 신청이 있어요. (#{pending[0]} · {pending[1]}개) 운영진 확인을 기다려주세요.")
+
+        admin_channel = bot.get_channel(EXCHANGE_ADMIN_CHANNEL_ID)
+        if admin_channel is None:
+            raise UserFacingError("교환 알림 채널을 찾을 수 없어요. 운영진에게 문의해주세요.")
+
+        verified = await adb("SELECT character_name FROM maple_verifications WHERE user_id=%s", (user.id,), "one")
+        char_name = verified[0] if verified else None
+
+        try:
+            req = await adb(
+                """
+                INSERT INTO piece_exchange_requests (user_id, amount, status, created_at, request_channel_id)
+                VALUES (%s, %s, 'pending', %s, %s) RETURNING id
+                """,
+                (user.id, amount, datetime.now(KST).isoformat(), interaction.channel_id), "one")
+        except psycopg2.IntegrityError:
+            raise UserFacingError("이미 처리 대기 중인 교환 신청이 있어요. 운영진 확인을 기다려주세요.")
+        request_id = req[0]
+
+        embed = maple_embed("💎 솔 에르다 조각 교환 신청", color=0x9B59B6)
+        embed.add_field(name="신청자", value=f"{user.mention} ({user})", inline=False)
+        embed.add_field(name="인게임 캐릭터", value=f"**{char_name}**" if char_name else "⚠️ 인증된 캐릭터 없음", inline=True)
+        embed.add_field(name="교환 개수", value=f"**{amount}개**", inline=True)
+        embed.add_field(name="신청 시점 보유", value=f"{pieces}개", inline=True)
+        embed.set_footer(text=f"요청 번호 #{request_id} · 인게임 지급 후 '지급 완료'를 눌러주세요")
+        content = f"<@{EXCHANGE_NOTIFY_USER_ID}>" if EXCHANGE_NOTIFY_USER_ID else None
+
+        try:
+            msg = await admin_channel.send(content=content, embed=embed, view=build_exchange_buttons(request_id))
+        except Exception:
+            await adb("DELETE FROM piece_exchange_requests WHERE id=%s", (request_id,))
+            raise
+        await adb("UPDATE piece_exchange_requests SET admin_message_id=%s WHERE id=%s", (msg.id, request_id))
+
+        await interaction.followup.send(
+            f"✅ 조각 **{amount}개** 교환 신청이 접수됐어요! 운영진이 인게임에서 지급하면 조각이 차감됩니다.", ephemeral=True)
+    except UserFacingError as e:
+        await interaction.followup.send(f"❌ {e}", ephemeral=True)
+    except Exception as e:
+        import traceback
+        print(f"[조각 교환 신청 오류] {e!r}")
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ 처리 중 오류가 발생했습니다: `{e}`", ephemeral=True)
+
+
+def _complete_exchange_sync(request_id, admin_id):
+    """신청 확정 + 조각 차감을 한 번에 처리합니다. (중복 클릭해도 한 번만 차감)"""
+    conn = get_db_connection_plain()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT user_id, amount, status FROM piece_exchange_requests WHERE id=%s FOR UPDATE", (request_id,))
+        row = cur.fetchone()
+        if not row or row[2] != "pending":
+            conn.rollback()
+            return ("already", None, None, None)
+        user_id, amount, _ = row
+
+        cur.execute(
+            """
+            UPDATE attendance_users SET sol_erda_pieces = sol_erda_pieces - %s
+            WHERE user_id=%s AND COALESCE(sol_erda_pieces, 0) >= %s
+            RETURNING sol_erda_pieces
+            """,
+            (amount, user_id, amount))
+        left = cur.fetchone()
+        if not left:
+            cur.execute("SELECT COALESCE(sol_erda_pieces, 0) FROM attendance_users WHERE user_id=%s", (user_id,))
+            now_row = cur.fetchone()
+            conn.rollback()
+            return ("insufficient", user_id, amount, now_row[0] if now_row else 0)
+
+        cur.execute(
+            "UPDATE piece_exchange_requests SET status='completed', decided_by=%s, decided_at=%s WHERE id=%s",
+            (admin_id, datetime.now(KST).isoformat(), request_id))
+        conn.commit()
+        cur.close()
+        return ("ok", user_id, amount, left[0])
+    finally:
+        conn.close()
+
+
+async def handle_exchange_decision(interaction: discord.Interaction, request_id: int, complete: bool):
+    if not _is_verify_admin(interaction.user):
+        await interaction.response.send_message("❌ 운영진만 처리할 수 있어요.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    left = None
+    if complete:
+        result, user_id, amount, left = await asyncio.to_thread(_complete_exchange_sync, request_id, interaction.user.id)
+        if result == "already":
+            await interaction.followup.send("이미 처리되었거나 존재하지 않는 신청입니다.", ephemeral=True)
+            return
+        if result == "insufficient":
+            await interaction.followup.send(
+                f"❌ <@{user_id}> 님의 현재 조각({left}개)이 신청 개수({amount}개)보다 적어서 차감하지 못했어요. "
+                f"신청은 대기 상태로 남아 있으니 확인 후 다시 눌러주거나 거절해주세요.", ephemeral=True)
+            return
+    else:
+        row = await adb(
+            """
+            UPDATE piece_exchange_requests SET status='rejected', decided_by=%s, decided_at=%s
+            WHERE id=%s AND status='pending' RETURNING user_id, amount
+            """,
+            (interaction.user.id, datetime.now(KST).isoformat(), request_id), "one")
+        if not row:
+            await interaction.followup.send("이미 처리되었거나 존재하지 않는 신청입니다.", ephemeral=True)
+            return
+        user_id, amount = row
+
+    # 알림 메시지 갱신 (버튼 비활성화)
+    try:
+        embed = interaction.message.embeds[0] if interaction.message.embeds else None
+        if embed:
+            embed.color = 0x2ECC71 if complete else 0xE74C3C
+            embed.add_field(
+                name="처리 결과",
+                value=(f"✅ 지급 완료 · {interaction.user.mention} (남은 조각 {left}개)" if complete
+                       else f"❌ 거절 · {interaction.user.mention}"),
+                inline=False)
+        await interaction.message.edit(embed=embed, view=build_exchange_buttons(request_id, disabled=True))
+    except Exception as e:
+        print(f"[조각 교환] 알림 메시지 갱신 실패: {e}")
+
+    # 신청한 채널에 결과 안내
+    try:
+        row = await adb("SELECT request_channel_id FROM piece_exchange_requests WHERE id=%s", (request_id,), "one")
+        ch = bot.get_channel(row[0]) if row and row[0] else None
+        if ch:
+            if complete:
+                await ch.send(f"💎 <@{user_id}> 님, 솔 에르다 조각 **{amount}개** 교환이 완료됐어요! (남은 조각 {left}개)")
+            else:
+                await ch.send(f"<@{user_id}> 님, 솔 에르다 조각 {amount}개 교환 신청이 거절되었어요. 조각은 차감되지 않았습니다.")
+    except Exception as e:
+        print(f"[조각 교환] 결과 안내 실패: {e}")
+
+    await interaction.followup.send("처리 완료!", ephemeral=True)
+
+
+bot.tree.add_command(piece_group)
 
 
 # 봇 실행부
