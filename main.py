@@ -450,6 +450,175 @@ async def handle_end_trade_button(interaction: discord.Interaction, seller_id: i
     except Exception as e:
         print(f"거래 채널 삭제 실패: {e}")
 
+# ------------------------------------------
+# 구매글 (메소 삽니다) — 판매글과 같은 구조
+#
+# 구매글 작성자 = 구매자(buyer), "판매" 버튼을 누르는 사람 = 판매자(seller)
+# 버튼 custom_id 안에 구매자 ID를 넣어 재시작 후에도 동작합니다.
+# ------------------------------------------
+class BuyModal(discord.ui.Modal, title="구매글 등록"):
+    buy_amount = discord.ui.TextInput(label="구매 수량을 입력해주세요", placeholder="10억 메소는 10", required=True)
+    buy_price = discord.ui.TextInput(label="1억당 가격을 입력해주세요", placeholder="1600원은 1600, 1500원은 1500으로 입력해주세요", required=True)
+    buy_comment = discord.ui.TextInput(label="추가로 하실 말씀을 적어주세요", required=False, style=discord.TextStyle.paragraph)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        buyer = interaction.user
+        buy_amount = self.buy_amount.value
+        buy_price = self.buy_price.value
+        buy_comment = self.buy_comment.value
+
+        embed = discord.Embed(title="메소 삽니다", color=discord.Color.blue())
+        embed.add_field(name="", value=buy_amount + "억 메소를 억당" + buy_price + "원으로 구매합니다", inline=False)
+        embed.add_field(name="", value=buy_comment if buy_comment else "", inline=False)
+        embed.set_footer(text="판매를 누르면 바로 채널이 생성되니 주의해주세요!")
+
+        await interaction.response.send_message(embed=embed, view=build_buy_post_view(buyer), ephemeral=False)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        import traceback
+        print(f"[구매글 등록 모달 오류] error={error!r}")
+        traceback.print_exc()
+        msg = f"❌ 구매글 등록 중 오류가 발생했습니다: `{error}`"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
+
+
+class Buyview(ErrorReportingView):
+    def __init__(self, buyer: discord.User | discord.Member):
+        super().__init__(timeout=None)
+        self.buyer = buyer
+
+    @discord.ui.button(label="나도 등록하기", style=discord.ButtonStyle.blurple, emoji="📝", custom_id="buy_register_button")
+    async def register_buy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BuyModal())
+
+
+def build_buy_post_view(buyer: discord.User | discord.Member) -> discord.ui.View:
+    view = ErrorReportingView(timeout=None)
+
+    sell_button = discord.ui.Button(
+        label="판매",
+        style=discord.ButtonStyle.blurple,
+        custom_id=f"sell_button:{buyer.id}",
+    )
+    sell_button.callback = _noop_button_callback
+    view.add_item(sell_button)
+
+    register_button = discord.ui.Button(
+        label="나도 등록하기",
+        style=discord.ButtonStyle.blurple,
+        emoji="📝",
+        custom_id="buy_register_button",
+    )
+    async def _register_callback(interaction: discord.Interaction):
+        await interaction.response.send_modal(BuyModal())
+    register_button.callback = _register_callback
+    view.add_item(register_button)
+
+    return view
+
+
+def build_buy_trade_control_view(buyer_id: int, original_channel_id: int, original_message_id: int) -> discord.ui.View:
+    view = ErrorReportingView(timeout=None)
+    end_button = discord.ui.Button(
+        label="거래 끝내기",
+        style=discord.ButtonStyle.red,
+        custom_id=f"end_buy_trade:{buyer_id}:{original_channel_id}:{original_message_id}",
+    )
+    end_button.callback = _noop_button_callback
+    view.add_item(end_button)
+    return view
+
+
+async def handle_sell_button(interaction: discord.Interaction, buyer_id: int):
+    seller = interaction.user
+    guild = interaction.guild
+
+    if seller.id == buyer_id:
+        await interaction.response.send_message("자신의 구매글에는 판매할 수 없습니다.", ephemeral=True)
+        return
+
+    buyer = guild.get_member(buyer_id)
+    if buyer is None:
+        try:
+            buyer = await guild.fetch_member(buyer_id)
+        except discord.NotFound:
+            await interaction.response.send_message(
+                "구매자 정보를 찾을 수 없습니다. (서버에서 나갔을 수 있어요)", ephemeral=True
+            )
+            return
+
+    category = guild.get_channel(CATEGORY_ID[0])
+    if not isinstance(category, discord.CategoryChannel):
+        category = None
+
+    await interaction.response.defer(ephemeral=True)
+
+    original_message = interaction.message
+    original_embed = original_message.embeds[0] if original_message.embeds else None
+    trading_message = discord.Embed(title="거래중...", description="현재 거래가 진행 중인 게시글 입니다.")
+    await original_message.edit(embed=trading_message, view=Buyview(buyer=buyer))
+
+    try:
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            seller: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
+            buyer: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
+        }
+        channel_name = f"{seller.name}님의 판매문의"
+        new_channel = await guild.create_text_channel(name=channel_name, overwrites=overwrites, category=category)
+
+        embed = discord.Embed(
+            title="메소 판매 문의",
+            description=f"{buyer.mention}님과 {seller.mention}님의 판매 문의 채널입니다.",
+            color=discord.Color.blue(),
+        )
+        view = build_buy_trade_control_view(buyer.id, original_message.channel.id, original_message.id)
+        await new_channel.send(embed=embed, view=view)
+        await new_channel.send(f"{buyer.mention}{seller.mention}")
+        await interaction.followup.send(f"{new_channel.mention} 채널이 생성되었습니다.", ephemeral=True)
+    except Exception:
+        # 채널 생성 중 실패하면 구매글이 "거래중"에 갇히지 않도록 원래 상태로 되돌립니다.
+        try:
+            restore_embed = original_embed if original_embed else discord.Embed(title="메소 삽니다", color=discord.Color.blue())
+            await original_message.edit(embed=restore_embed, view=build_buy_post_view(buyer))
+        except Exception:
+            pass
+        raise
+
+
+async def handle_end_buy_trade_button(interaction: discord.Interaction, buyer_id: int, original_channel_id: int, original_message_id: int):
+    if interaction.user.id != buyer_id:
+        await interaction.response.send_message("거래를 종료할 권한이 없습니다.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("거래를 종료합니다. 1분 뒤 채널이 삭제 됩니다.", ephemeral=True)
+
+    try:
+        original_channel = interaction.guild.get_channel(original_channel_id)
+        if original_channel is None:
+            original_channel = await bot.fetch_channel(original_channel_id)
+        original_message = await original_channel.fetch_message(original_message_id)
+
+        buyer = interaction.guild.get_member(buyer_id) or interaction.user
+        end_embed = discord.Embed(title="구매 완료", description="거래가 종료된 게시글입니다.", color=discord.Color.yellow())
+        await original_message.edit(embed=end_embed, view=Buyview(buyer=buyer))
+    except Exception as e:
+        print(f"구매 거래 종료 처리 중 원본 게시글 갱신 실패: {e}")
+
+    await asyncio.sleep(60)
+    try:
+        await interaction.channel.delete()
+    except Exception as e:
+        print(f"구매 거래 채널 삭제 실패: {e}")
+
+
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     if interaction.type != discord.InteractionType.component:
@@ -476,6 +645,25 @@ async def on_interaction(interaction: discord.Interaction):
             except ValueError:
                 return
             await handle_end_trade_button(interaction, seller_id, original_channel_id, original_message_id)
+
+        elif custom_id.startswith("sell_button:"):
+            try:
+                buyer_id = int(custom_id.split(":", 1)[1])
+            except (IndexError, ValueError):
+                return
+            await handle_sell_button(interaction, buyer_id)
+
+        elif custom_id.startswith("end_buy_trade:"):
+            parts = custom_id.split(":")
+            if len(parts) != 4:
+                return
+            try:
+                buyer_id = int(parts[1])
+                original_channel_id = int(parts[2])
+                original_message_id = int(parts[3])
+            except ValueError:
+                return
+            await handle_end_buy_trade_button(interaction, buyer_id, original_channel_id, original_message_id)
 
         elif custom_id.startswith("verify_approve:") or custom_id.startswith("verify_reject:"):
             try:
@@ -517,6 +705,7 @@ async def on_ready():
     # (custom_id가 고정되어 있어야 하고, 이 등록은 봇 프로세스당 한 번만 하면 됩니다)
     if not bot.persistent_views_added:
         bot.add_view(Saleview(seller=None))
+        bot.add_view(Buyview(buyer=None))
         bot.persistent_views_added = True
 
     print(f'로그인 성공: {bot.user.name}')
@@ -934,6 +1123,13 @@ async def register_sale_post(interaction: discord.Interaction):
     embed = discord.Embed(title="판매글 등록", description="판매글을 등록합니다.", color=discord.Color.green())
     embed.add_field(name="판매글 등록하기", value="판매글등록을 하기 위해서 아래 버튼을 눌러주세요", inline=False)
     await interaction.response.send_message(embed=embed, view=Saleview(seller=interaction.user), ephemeral=False)
+
+@bot.tree.command(name="구매글등록", description="구매글을 등록합니다.")
+@app_commands.checks.has_permissions(administrator=True)
+async def register_buy_post(interaction: discord.Interaction):
+    embed = discord.Embed(title="구매글 등록", description="구매글을 등록합니다.", color=discord.Color.blue())
+    embed.add_field(name="구매글 등록하기", value="구매글등록을 하기 위해서 아래 버튼을 눌러주세요", inline=False)
+    await interaction.response.send_message(embed=embed, view=Buyview(buyer=interaction.user), ephemeral=False)
 
 @bot.tree.command(name="출석확인", description="누적 출석 일수와 솔 에르다 조각 정보를 확인합니다.")
 async def check_attendance(interaction: discord.Interaction):
@@ -2018,6 +2214,11 @@ async def handle_verify_decision(interaction: discord.Interaction, request_id: i
             nick_note = f"\n⚠️ 닉네임 변경 실패: {e}"
         # 같은 캐릭터로 남아있던 다른 계정의 옛 기록 정리
         await adb("DELETE FROM maple_verifications WHERE ocid=%s AND user_id<>%s", (ocid, target_id))
+        # 인증 전에 이미 길드에 가입했던 본캐라면 지금 가입 알림
+        try:
+            await announce_join_on_verify(char_name)
+        except Exception as e:
+            print(f"[인증] 가입 알림 처리 실패: {e}")
 
     # 승인 메시지 갱신 (버튼 비활성화)
     try:
@@ -2102,6 +2303,45 @@ async def maple_unverified_members(interaction: discord.Interaction):
     await run_maple(interaction, build, ephemeral=True)
 
 
+# ------------------------------------------
+# 인증 길드원 닉네임 변경 처리 (공지 알림 + 디스코드 닉네임 자동 변경)
+# ------------------------------------------
+async def apply_character_rename(user_id, old_name, new_name):
+    """DB 반영 → 공지 채널 알림 → 디스코드 서버 닉네임을 새 인게임 닉네임으로 변경."""
+    await adb("UPDATE maple_verifications SET character_name=%s WHERE user_id=%s", (new_name, user_id))
+
+    nick_note = ""
+    guild = bot.get_guild(GUILD_ID_FOR_COMMANDS)
+    member = guild.get_member(user_id) if guild else None
+    if guild and member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except Exception:
+            member = None
+    if member is not None:
+        try:
+            await member.edit(nick=new_name[:32], reason=f"인게임 닉네임 변경 반영 ({old_name} → {new_name})")
+        except discord.Forbidden:
+            nick_note = "⚠️ 권한 문제로 디스코드 닉네임은 변경하지 못했어요."
+            print(f"[닉네임 변경] {user_id} 디스코드 닉네임 변경 권한 없음 (서버 주인이거나 봇 역할이 더 낮음)")
+        except Exception as e:
+            nick_note = "⚠️ 디스코드 닉네임 변경 중 오류가 발생했어요."
+            print(f"[닉네임 변경] {user_id} 디스코드 닉네임 변경 실패: {e}")
+
+    ch = bot.get_channel(MAPLE_NOTICE_CHANNEL_ID)
+    if ch:
+        e = maple_embed("✏️ 길드원 닉네임 변경", color=0x3498DB)
+        e.add_field(name="길드원", value=f"<@{user_id}>", inline=False)
+        e.add_field(name="변경 전", value=f"`{old_name}`", inline=True)
+        e.add_field(name="변경 후", value=f"**{new_name}**", inline=True)
+        if nick_note:
+            e.set_footer(text=nick_note)
+        try:
+            await ch.send(embed=e, allowed_mentions=discord.AllowedMentions(users=False))
+        except Exception as ex:
+            print(f"[닉네임 변경] 공지 알림 전송 실패: {ex}")
+
+
 @tasks.loop(time=dt_time(hour=4, minute=0, tzinfo=KST))
 async def maple_guild_member_check():
     """매일 새벽 4시: 인증된 유저의 닉네임 변경을 기록에 반영합니다. (탈퇴 알림은 가입/탈퇴 알림에서 처리)"""
@@ -2114,7 +2354,7 @@ async def maple_guild_member_check():
             continue
         new_name = basic.get("character_name") or char_name
         if new_name != char_name:
-            await adb("UPDATE maple_verifications SET character_name=%s WHERE user_id=%s", (new_name, user_id))
+            await apply_character_rename(user_id, char_name, new_name)
         await asyncio.sleep(0.2)
 
 
@@ -2555,6 +2795,47 @@ async def maple_probability(interaction: discord.Interaction):
 MEMBER_CHANGE_CHANNEL_ID = MAPLE_NOTICE_CHANNEL_ID   # 가입/탈퇴 알림 채널 (바꾸려면 여기 ID만 수정)
 
 
+async def _load_state_list(key):
+    row = await adb("SELECT value FROM maple_state WHERE key=%s", (key,), "one")
+    if not row:
+        return []
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return []
+
+
+async def _save_state_list(key, items):
+    await adb(
+        """
+        INSERT INTO maple_state (key, value) VALUES (%s, %s)
+        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+        """,
+        (key, json.dumps(items[-300:], ensure_ascii=False)))
+
+
+async def announce_main_join(char_name):
+    """인증(본캐)된 캐릭터의 길드 가입을 공지 채널에 알립니다."""
+    ch = bot.get_channel(MEMBER_CHANGE_CHANNEL_ID)
+    if not ch:
+        return
+    e = maple_embed(f"👥 {MAPLE_GUILD_NAME} 길드원 변동", color=0x1ABC9C)
+    e.add_field(name="➕ 가입 (1)", value=char_name, inline=False)
+    try:
+        await ch.send(embed=e)
+    except Exception as ex:
+        print(f"[길드원 변동 알림] 가입 알림 전송 실패: {ex}")
+
+
+async def announce_join_on_verify(char_name):
+    """인증 승인 시: 인증 전에 이미 길드에 가입해 알림이 보류됐던 캐릭터면 지금 가입 알림을 보냅니다."""
+    pending = await _load_state_list("pending_unverified_joins")
+    key = char_name.lower()
+    if any(n.lower() == key for n in pending):
+        await _save_state_list("pending_unverified_joins", [n for n in pending if n.lower() != key])
+        await announce_main_join(char_name)
+
+
 def diff_members(old_names, new_names):
     old_map = {n.lower(): n for n in old_names}
     new_map = {n.lower(): n for n in new_names}
@@ -2563,11 +2844,15 @@ def diff_members(old_names, new_names):
     return sorted(joined), sorted(left)
 
 
-async def alert_verified_left(left_names):
-    """길드원 목록에서 빠진 캐릭터 중 인증된 유저가 있고 실제로 길드를 떠났다면 운영진 채널에 알립니다."""
+async def check_verified_left(left_names):
+    """길드원 목록에서 빠진 캐릭터 중 인증된 유저를 확인합니다.
+    닉네임만 바뀐 경우 닉네임 변경 처리(공지 + 디스코드 닉네임 변경)를 하고,
+    실제로 길드를 떠났다면 운영진 채널에 알립니다.
+    반환값: 닉네임 변경으로 확인된 [(이전 닉네임, 새 닉네임), ...]"""
     rows = await adb("SELECT user_id, character_name, ocid FROM maple_verifications", (), "all")
     left_set = {n.lower() for n in left_names}
     alerts = []
+    renamed = []
     for user_id, char_name, ocid in rows:
         if char_name.lower() not in left_set:
             continue
@@ -2576,13 +2861,17 @@ async def alert_verified_left(left_names):
         except Exception:
             continue
         new_name = basic.get("character_name") or char_name
+        in_guild = basic.get("character_guild_name") == MAPLE_GUILD_NAME
         if new_name != char_name:
-            await adb("UPDATE maple_verifications SET character_name=%s WHERE user_id=%s", (new_name, user_id))
-        if basic.get("character_guild_name") != MAPLE_GUILD_NAME:
+            await apply_character_rename(user_id, char_name, new_name)
+            if in_guild:
+                renamed.append((char_name, new_name))
+        if not in_guild:
             alerts.append(f"<@{user_id}> · `{new_name}` → 현재 길드: {safe_text(basic.get('character_guild_name'), '없음')}")
     ch = bot.get_channel(VERIFY_ADMIN_CHANNEL_ID)
     if alerts and ch:
         await ch.send("⚠️ **길드를 탈퇴한 것으로 보이는 인증 유저**입니다. 확인 후 필요하면 `/인증해제` 해주세요.\n" + "\n".join(alerts)[:1800])
+    return renamed
 
 
 @tasks.loop(minutes=30)
@@ -2596,17 +2885,39 @@ async def maple_member_change_check():
         if row:
             old = json.loads(row[0])
             joined, left = diff_members(old, names)
+            # 인증된 길드원의 닉네임 변경은 따로 알리고, 가입/탈퇴 목록에서는 빼줍니다.
+            if left:
+                renamed = await check_verified_left(left)
+                old_set = {o.lower() for o, _ in renamed}
+                new_set = {n.lower() for _, n in renamed}
+                left = [n for n in left if n.lower() not in old_set]
+                joined = [n for n in joined if n.lower() not in new_set]
+
+            # 부계정 등 인증되지 않은 캐릭터는 알림에서 제외 (인증된 본캐만 표시)
+            vrows = await adb("SELECT character_name FROM maple_verifications", (), "all")
+            verified = {r[0].lower() for r in vrows}
+            hidden_joined = [n for n in joined if n.lower() not in verified]
+            joined = [n for n in joined if n.lower() in verified]
+            left = [n for n in left if n.lower() in verified]
+
+            # 인증 전에 먼저 가입한 본캐도 있을 수 있어, 숨긴 가입자는 보류 목록에 넣어두고
+            # 나중에 인증이 승인되면 그때 가입 알림을 보냅니다. (탈퇴한 캐릭터는 보류 목록에서 제거)
+            pending = await _load_state_list("pending_unverified_joins")
+            current = {n.lower() for n in names}
+            pending = [n for n in pending if n.lower() in current]
+            pending_set = {n.lower() for n in pending}
+            pending += [n for n in hidden_joined if n.lower() not in pending_set]
+            await _save_state_list("pending_unverified_joins", pending)
+
             ch = bot.get_channel(MEMBER_CHANGE_CHANNEL_ID)
             if ch and (joined or left):
                 e = maple_embed(f"👥 {MAPLE_GUILD_NAME} 길드원 변동", color=0x1ABC9C)
                 if joined:
                     e.add_field(name=f"➕ 가입 ({len(joined)})", value="\n".join(joined)[:1000], inline=False)
                 if left:
-                    e.add_field(name=f"➖ 탈퇴/닉네임 변경 ({len(left)})", value="\n".join(left)[:1000], inline=False)
-                e.set_footer(text=f"현재 길드원 {len(names)}명 · 닉네임을 바꾼 경우 탈퇴+가입으로 함께 표시될 수 있어요")
+                    e.add_field(name=f"➖ 탈퇴 ({len(left)})", value="\n".join(left)[:1000], inline=False)
+                e.set_footer(text=f"현재 길드원 {len(names)}명 · 인증된 본캐릭터만 표시돼요")
                 await ch.send(embed=e)
-            if left:
-                await alert_verified_left(left)
         await adb(
             """
             INSERT INTO maple_state (key, value) VALUES (%s, %s)
