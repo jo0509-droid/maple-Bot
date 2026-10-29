@@ -951,6 +951,25 @@ async def award_voice_exp():
 
 @tasks.loop(minutes=1)
 async def check_voice_time():
+    # 여기서 오류가 그대로 올라가면 반복 작업 자체가 멈춰서 출석이 전부 안 됩니다.
+    # 그래서 오류를 잡아 로그만 남기고 다음 1분에 다시 시도합니다.
+    try:
+        await _check_voice_time_inner()
+    except Exception as e:
+        import traceback
+        print(f"[출석 체크] 오류 (다음 1분에 다시 시도): {e!r}")
+        traceback.print_exc()
+
+
+@check_voice_time.error
+async def _check_voice_time_error(error):
+    print(f"[출석 체크] 반복 작업이 멈춰 다시 시작합니다: {error!r}")
+    await asyncio.sleep(5)
+    if not check_voice_time.is_running():
+        check_voice_time.start()
+
+
+async def _check_voice_time_inner():
     now = datetime.now(KST)
     today_str = now.strftime("%Y-%m-%d")
 
@@ -1003,7 +1022,10 @@ async def check_voice_time():
                 current_time = user_voice_seconds.get(member.id, 0) + 60
                 user_voice_seconds[member.id] = current_time
                 if current_time >= 600:  # 10분(600초) 단축
-                    await process_attendance(member, today_str)
+                    try:
+                        await process_attendance(member, today_str)
+                    except Exception as e:
+                        print(f"[출석 체크] {member} 출석 처리 실패: {e!r}")
     conn.commit()
     cursor.close()
     conn.close()
@@ -1066,22 +1088,19 @@ async def process_attendance(member, today_str):
     if reward_msg:
         base_desc += f"\n{reward_msg}"
 
-    if count == 1: 
-        await channel.send(
-            f"🐣 {member.mention}님 천 리 길도 한 걸음부터입니다!\n" + base_desc
-        )
+    if count == 1:
+        head = f"🐣 {member.mention}님 천 리 길도 한 걸음부터입니다!\n"
     elif count % 15 == 0 and count < 30:
-        await channel.send(
-            f"🐣 {member.mention}님 시작이 반입니다! 축하드립니다!\n" + base_desc
-        )
+        head = f"🐣 {member.mention}님 시작이 반입니다! 축하드립니다!\n"
     elif count % 30 == 0 and count != 0:
-        await channel.send(
-            f"🐣 {member.mention}님 수고하셨습니다! 대단합니다!\n" + base_desc
-        )
+        head = f"🐣 {member.mention}님 수고하셨습니다! 대단합니다!\n"
     else:
-        await channel.send(
-            f"✅ {member.mention}님 오늘 출석이 완료되었습니다!\n" + base_desc
-        )
+        head = f"✅ {member.mention}님 오늘 출석이 완료되었습니다!\n"
+    try:
+        await channel.send(head + base_desc)
+    except Exception as e:
+        # 출석은 이미 DB에 저장됐으니 메시지만 실패한 경우입니다. (채널 권한 확인 필요)
+        print(f"[출석 체크] 출석 채널 메시지 전송 실패: {e!r}")
 
 # ------------------------------------------
 # 통합 에러 핸들러
