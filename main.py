@@ -672,6 +672,13 @@ async def on_interaction(interaction: discord.Interaction):
                 return
             await handle_verify_decision(interaction, request_id, custom_id.startswith("verify_approve:"))
 
+        elif custom_id.startswith("ticket_enter:"):
+            try:
+                item_id = int(custom_id.split(":", 1)[1])
+            except (IndexError, ValueError):
+                return
+            await handle_ticket_enter(interaction, item_id)
+
         elif custom_id.startswith("exchange_done:") or custom_id.startswith("exchange_reject:"):
             try:
                 request_id = int(custom_id.split(":", 1)[1])
@@ -697,8 +704,14 @@ async def on_interaction(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     init_attendance_db()
+    try:
+        init_ticket_db()
+    except Exception as e:
+        print(f"[티켓] DB 초기화 실패: {e!r}")
     if not check_voice_time.is_running():
         check_voice_time.start()
+    if not ticket_draw_check.is_running():
+        ticket_draw_check.start()
     start_maple_background_tasks()
 
     # "나도 등록하기" 버튼이 재배포 후에도 계속 작동하도록 다시 등록합니다.
@@ -953,6 +966,12 @@ async def award_voice_exp():
 async def check_voice_time():
     # 여기서 오류가 그대로 올라가면 반복 작업 자체가 멈춰서 출석이 전부 안 됩니다.
     # 그래서 오류를 잡아 로그만 남기고 다음 1분에 다시 시도합니다.
+    # 활동 티켓 적립 (오류가 나도 출석 체크는 계속)
+    try:
+        await award_voice_tickets()
+    except Exception as e:
+        print(f"[티켓] 활동 티켓 적립 오류: {e!r}")
+
     try:
         await _check_voice_time_inner()
     except Exception as e:
@@ -1152,6 +1171,8 @@ async def register_buy_post(interaction: discord.Interaction):
 
 @bot.tree.command(name="출석확인", description="누적 출석 일수와 솔 에르다 조각 정보를 확인합니다.")
 async def check_attendance(interaction: discord.Interaction):
+    if not await ensure_channel(interaction, MY_INFO_CHANNEL_ID, "출석/조각 확인"):
+        return
     user_id = interaction.user.id
     today_str = datetime.now(KST).strftime("%Y-%m-%d")
 
@@ -1163,15 +1184,13 @@ async def check_attendance(interaction: discord.Interaction):
     row = cursor.fetchone()
 
     if row is None:
-        cursor.execute(
-            "INSERT INTO attendance_users (user_id, last_check, count, sol_erda_pieces) VALUES (%s, %s, %s, %s)",
-            (user_id, today_str, 0, 0),
-        )
-        conn.commit()
+        # (예전에는 여기서 오늘 날짜로 기록을 만들어서, 출석 전에 /출석확인을 쓴 사람은
+        #  그날 출석이 체크되지 않는 문제가 있었습니다. 이제 기록을 만들지 않습니다.)
         count = 0
         pieces = 0
     else:
         last_check, count, pieces = row
+        count = count or 0
 
     cursor.close()
     conn.close()
@@ -3124,6 +3143,7 @@ def start_maple_background_tasks():
 # 솔 에르다 조각 교환 (/조각 교환)
 # ------------------------------------------
 EXCHANGE_ADMIN_CHANNEL_ID = 1560971791231357030  # 교환 알림을 받을 채널
+EXCHANGE_REQUEST_CHANNEL_ID = 1560971791231357030  # /조각 교환 을 사용할 수 있는 채널
 EXCHANGE_NOTIFY_USER_ID = None  # 알림 때 멘션할 내 디스코드 ID (예: 123456789012345678). None이면 멘션 안 함
 
 piece_group = app_commands.Group(name="조각", description="솔 에르다 조각 관련 명령어")
@@ -3146,6 +3166,8 @@ def build_exchange_buttons(request_id, disabled=False):
 @app_commands.rename(amount="개수")
 @app_commands.describe(amount="교환할 조각 개수")
 async def piece_exchange(interaction: discord.Interaction, amount: app_commands.Range[int, 1]):
+    if not await ensure_channel(interaction, EXCHANGE_REQUEST_CHANNEL_ID, "조각 교환"):
+        return
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         user = interaction.user
@@ -3300,6 +3322,525 @@ async def handle_exchange_decision(interaction: discord.Interaction, request_id:
 
 
 bot.tree.add_command(piece_group)
+
+
+# ------------------------------------------
+# 활동 티켓 & 티켓교환소 응모
+#
+# - 길드 음성방(ACTIVITY_RATES에 등록된 방 = 활동 경험치 받는 방)에 누적 60분 있으면 티켓 1장
+#   (진행도는 DB에 저장돼서 봇이 재시작돼도 이어서 셉니다)
+# - 운영진이 /티켓 매물등록 으로 티켓교환소 채널에 응모 매물을 올리면, 유저는 [응모하기] 버튼으로 응모
+#   (1회 응모마다 응모 비용만큼 티켓 차감, 여러 번 응모 가능 → 당첨 확률 증가, 한 사람은 매물당 1번만 당첨)
+# - 매주 목요일 0시(KST)에 자동 추첨 → 당첨자 발표 + 운영진 채널에 지급 목록 알림
+# ------------------------------------------
+TICKET_SHOP_CHANNEL_ID = 1565372743686299670   # 티켓교환소 채널 (티켓 응모는 이 채널에서만 가능)
+MY_INFO_CHANNEL_ID = 1565373298727063683       # 내정보 채널 (조각/티켓/출석 확인은 이 채널에서만 가능)
+TICKET_SHOP_CHANNEL_NAME = "티켓교환소"
+TICKET_MINUTES_PER_TICKET = 60  # 티켓 1장에 필요한 음성방 활동 시간(분)
+TICKET_MAX_ENTRIES_PER_USER = None  # 매물당 한 사람이 응모할 수 있는 최대 횟수 (None = 제한 없음)
+TICKET_ADMIN_CHANNEL_ID = EXCHANGE_ADMIN_CHANNEL_ID  # 당첨자 지급 목록을 받을 운영진 채널
+
+ticket_group = app_commands.Group(name="티켓", description="활동 티켓 / 티켓교환소 관련 명령어")
+
+
+async def ensure_channel(interaction: discord.Interaction, channel_id, label):
+    """지정된 채널이 아니면 안내 후 False를 돌려줍니다."""
+    if not channel_id or interaction.channel_id == channel_id:
+        return True
+    msg = f"❌ 이 기능은 <#{channel_id}> 채널에서만 사용할 수 있어요. ({label})"
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+    return False
+
+
+def init_ticket_db():
+    conn = get_db_connection_plain()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ticket_users (
+                user_id BIGINT PRIMARY KEY,
+                tickets INTEGER DEFAULT 0,
+                minutes INTEGER DEFAULT 0
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ticket_items (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                winners INTEGER NOT NULL,
+                cost INTEGER NOT NULL,
+                status TEXT DEFAULT 'open',
+                channel_id BIGINT,
+                message_id BIGINT,
+                created_by BIGINT,
+                created_at TEXT,
+                draw_at TEXT,
+                result TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ticket_entries (
+                id SERIAL PRIMARY KEY,
+                item_id INTEGER NOT NULL,
+                user_id BIGINT NOT NULL,
+                created_at TEXT
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ticket_entries_item ON ticket_entries (item_id)")
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def next_thursday_midnight(now=None):
+    """다음 목요일 0시(KST). 지금이 목요일 0시 이후라면 다음 주 목요일."""
+    now = now or datetime.now(KST)
+    days_ahead = (3 - now.weekday()) % 7  # 월=0 ... 목=3
+    target = datetime(now.year, now.month, now.day, tzinfo=KST) + timedelta(days=days_ahead)
+    if target <= now:
+        target += timedelta(days=7)
+    return target
+
+
+def get_ticket_shop_channel(guild=None):
+    if TICKET_SHOP_CHANNEL_ID:
+        return bot.get_channel(TICKET_SHOP_CHANNEL_ID)
+    guilds = [guild] if guild else bot.guilds
+    for g in guilds:
+        for ch in g.text_channels:
+            if TICKET_SHOP_CHANNEL_NAME in ch.name:
+                return ch
+    return None
+
+
+# ---------- 티켓 적립 (1분마다 check_voice_time에서 호출) ----------
+def _tick_tickets_sync(user_ids):
+    """대상 유저들의 활동 시간을 1분 올리고, 60분을 채운 유저에게 티켓을 지급합니다."""
+    conn = get_db_connection_plain()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO ticket_users (user_id, tickets, minutes)
+            SELECT uid, 0, 1 FROM unnest(%s::bigint[]) AS uid
+            ON CONFLICT (user_id) DO UPDATE SET minutes = ticket_users.minutes + 1
+            """,
+            (list(user_ids),))
+        cur.execute(
+            """
+            UPDATE ticket_users
+            SET tickets = tickets + minutes / %s, minutes = minutes %% %s
+            WHERE minutes >= %s
+            RETURNING user_id, tickets
+            """,
+            (TICKET_MINUTES_PER_TICKET, TICKET_MINUTES_PER_TICKET, TICKET_MINUTES_PER_TICKET))
+        gained = cur.fetchall()
+        conn.commit()
+        cur.close()
+        return gained
+    finally:
+        conn.close()
+
+
+async def award_voice_tickets():
+    user_ids = set()
+    for guild in bot.guilds:
+        for vc in guild.voice_channels:
+            if get_voice_exp_rate(vc) <= 0:
+                continue
+            for member in vc.members:
+                if not member.bot:
+                    user_ids.add(member.id)
+    if not user_ids:
+        return
+    gained = await asyncio.to_thread(_tick_tickets_sync, user_ids)
+    for user_id, total in gained:
+        print(f"[티켓] {user_id} 활동 {TICKET_MINUTES_PER_TICKET}분 달성 → 티켓 지급 (보유 {total}장)")
+
+
+# ---------- 매물 게시글 ----------
+def build_ticket_item_embed(item_id, name, description, winners, cost, draw_at_iso, total_entries, entrants):
+    draw_ts = int(datetime.fromisoformat(draw_at_iso).timestamp())
+    e = discord.Embed(title=f"🎁 {name}", description=description or None, color=0xE67E22)
+    e.add_field(name="당첨 인원", value=f"**{winners}명**", inline=True)
+    e.add_field(name="응모 비용", value=f"🎟️ 티켓 **{cost}장** / 1회", inline=True)
+    e.add_field(name="현재 응모", value=f"{total_entries}회 · {entrants}명", inline=True)
+    e.add_field(name="추첨 일시", value=f"<t:{draw_ts}:F> (<t:{draw_ts}:R>)", inline=False)
+    limit = f"1인 최대 {TICKET_MAX_ENTRIES_PER_USER}회" if TICKET_MAX_ENTRIES_PER_USER else "여러 번 응모 가능 (많이 응모할수록 확률 UP)"
+    e.set_footer(text=f"매물 #{item_id} · {limit} · 한 사람은 1번만 당첨돼요 · 낙첨 시 티켓은 돌려받지 않아요")
+    return e
+
+
+def build_ticket_item_view(item_id, disabled=False):
+    view = ErrorReportingView(timeout=None)
+    btn = discord.ui.Button(label="응모하기", emoji="🎟️", style=discord.ButtonStyle.primary,
+                            custom_id=f"ticket_enter:{item_id}", disabled=disabled)
+    btn.callback = _noop_button_callback
+    view.add_item(btn)
+    return view
+
+
+async def refresh_ticket_item_message(item_id):
+    row = await adb(
+        "SELECT name, description, winners, cost, draw_at, channel_id, message_id, status FROM ticket_items WHERE id=%s",
+        (item_id,), "one")
+    if not row or row[7] != "open":
+        return
+    name, desc, winners, cost, draw_at, ch_id, msg_id, _ = row
+    stats = await adb(
+        "SELECT COUNT(*), COUNT(DISTINCT user_id) FROM ticket_entries WHERE item_id=%s", (item_id,), "one")
+    ch = bot.get_channel(ch_id) if ch_id else None
+    if not ch or not msg_id:
+        return
+    try:
+        msg = await ch.fetch_message(msg_id)
+        await msg.edit(embed=build_ticket_item_embed(item_id, name, desc, winners, cost, draw_at, stats[0], stats[1]))
+    except Exception as e:
+        print(f"[티켓] 매물 #{item_id} 게시글 갱신 실패: {e}")
+
+
+# ---------- 응모 ----------
+def _enter_ticket_item_sync(item_id, user_id):
+    conn = get_db_connection_plain()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT name, cost, status, draw_at FROM ticket_items WHERE id=%s FOR UPDATE", (item_id,))
+        item = cur.fetchone()
+        if not item or item[2] != "open" or datetime.fromisoformat(item[3]) <= datetime.now(KST):
+            conn.rollback()
+            return ("closed", None)
+        name, cost, _, _ = item
+
+        if TICKET_MAX_ENTRIES_PER_USER:
+            cur.execute("SELECT COUNT(*) FROM ticket_entries WHERE item_id=%s AND user_id=%s", (item_id, user_id))
+            if cur.fetchone()[0] >= TICKET_MAX_ENTRIES_PER_USER:
+                conn.rollback()
+                return ("limit", {"name": name})
+
+        cur.execute(
+            "UPDATE ticket_users SET tickets = tickets - %s WHERE user_id=%s AND tickets >= %s RETURNING tickets",
+            (cost, user_id, cost))
+        left = cur.fetchone()
+        if not left:
+            cur.execute("SELECT COALESCE(tickets, 0) FROM ticket_users WHERE user_id=%s", (user_id,))
+            r = cur.fetchone()
+            conn.rollback()
+            return ("insufficient", {"name": name, "cost": cost, "have": r[0] if r else 0})
+
+        cur.execute("INSERT INTO ticket_entries (item_id, user_id, created_at) VALUES (%s, %s, %s)",
+                    (item_id, user_id, datetime.now(KST).isoformat()))
+        cur.execute("SELECT COUNT(*) FROM ticket_entries WHERE item_id=%s AND user_id=%s", (item_id, user_id))
+        mine = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        return ("ok", {"name": name, "cost": cost, "left": left[0], "mine": mine})
+    finally:
+        conn.close()
+
+
+async def handle_ticket_enter(interaction: discord.Interaction, item_id: int):
+    if not await ensure_channel(interaction, TICKET_SHOP_CHANNEL_ID, "티켓 응모"):
+        return
+    await interaction.response.defer(ephemeral=True)
+    result, info = await asyncio.to_thread(_enter_ticket_item_sync, item_id, interaction.user.id)
+    if result == "closed":
+        await interaction.followup.send("❌ 응모가 마감되었거나 없는 매물이에요.", ephemeral=True)
+        return
+    if result == "limit":
+        await interaction.followup.send(
+            f"❌ **{info['name']}**은(는) 1인 최대 {TICKET_MAX_ENTRIES_PER_USER}회까지 응모할 수 있어요.", ephemeral=True)
+        return
+    if result == "insufficient":
+        await interaction.followup.send(
+            f"❌ 티켓이 부족해요. (필요 {info['cost']}장 / 보유 {info['have']}장)\n"
+            f"길드 음성방에서 {TICKET_MINUTES_PER_TICKET}분 활동할 때마다 티켓 1장을 받아요.", ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"✅ **{info['name']}** 응모 완료! (내 응모 {info['mine']}회 · 남은 티켓 {info['left']}장)", ephemeral=True)
+    await refresh_ticket_item_message(item_id)
+
+
+# ---------- 추첨 ----------
+def _draw_ticket_item_sync(item_id):
+    conn = get_db_connection_plain()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT name, winners, status FROM ticket_items WHERE id=%s FOR UPDATE", (item_id,))
+        item = cur.fetchone()
+        if not item or item[2] != "open":
+            conn.rollback()
+            return None
+        name, winners_n, _ = item
+        cur.execute("SELECT user_id FROM ticket_entries WHERE item_id=%s", (item_id,))
+        pool = [r[0] for r in cur.fetchall()]
+        total = len(pool)
+        rng = random.SystemRandom()
+        rng.shuffle(pool)
+        winners = []
+        for uid in pool:  # 응모 횟수가 많을수록 앞에 나올 확률이 높고, 같은 사람은 한 번만 당첨
+            if uid not in winners:
+                winners.append(uid)
+            if len(winners) >= winners_n:
+                break
+        cur.execute("UPDATE ticket_items SET status='drawn', result=%s WHERE id=%s",
+                    (json.dumps(winners), item_id))
+        conn.commit()
+        cur.close()
+        return {"name": name, "winners_n": winners_n, "winners": winners, "total": total,
+                "entrants": len(set(pool))}
+    finally:
+        conn.close()
+
+
+async def draw_ticket_item(item_id):
+    res = await asyncio.to_thread(_draw_ticket_item_sync, item_id)
+    if res is None:
+        return None
+    row = await adb("SELECT channel_id, message_id FROM ticket_items WHERE id=%s", (item_id,), "one")
+    ch = bot.get_channel(row[0]) if row and row[0] else None
+    mentions = "\n".join(f"🏆 <@{u}>" for u in res["winners"]) or "응모자가 없어 당첨자가 없어요."
+
+    # 원래 게시글: 마감 처리
+    if ch and row[1]:
+        try:
+            msg = await ch.fetch_message(row[1])
+            e = msg.embeds[0] if msg.embeds else discord.Embed(title=f"🎁 {res['name']}")
+            e.color = 0x95A5A6
+            e.title = f"🔒 [추첨 완료] {res['name']}"
+            e.add_field(name="당첨자", value=mentions[:1000], inline=False)
+            await msg.edit(embed=e, view=build_ticket_item_view(item_id, disabled=True))
+        except Exception as ex:
+            print(f"[티켓] 매물 #{item_id} 마감 처리 실패: {ex}")
+
+    # 티켓교환소에 당첨 발표
+    if ch:
+        try:
+            e = discord.Embed(title=f"🎉 {res['name']} 당첨자 발표", color=0xF1C40F,
+                              description=f"총 {res['entrants']}명 · {res['total']}회 응모 중 {len(res['winners'])}명 당첨!")
+            e.add_field(name="당첨자", value=mentions[:1000], inline=False)
+            e.set_footer(text=f"매물 #{item_id} · 당첨 상품은 운영진이 인게임에서 지급해드려요")
+            content = " ".join(f"<@{u}>" for u in res["winners"]) or None
+            await ch.send(content=content, embed=e)
+        except Exception as ex:
+            print(f"[티켓] 매물 #{item_id} 당첨 발표 실패: {ex}")
+
+    # 운영진 채널에 지급 목록
+    admin_ch = bot.get_channel(TICKET_ADMIN_CHANNEL_ID) if TICKET_ADMIN_CHANNEL_ID else None
+    if admin_ch and res["winners"]:
+        lines = []
+        for u in res["winners"]:
+            v = await adb("SELECT character_name FROM maple_verifications WHERE user_id=%s", (u,), "one")
+            lines.append(f"• <@{u}> · 캐릭터: **{v[0]}**" if v else f"• <@{u}> · ⚠️ 인증된 캐릭터 없음")
+        try:
+            e = discord.Embed(title=f"🎁 티켓 응모 당첨 · 지급 필요", color=0xE67E22,
+                              description=f"**{res['name']}** (매물 #{item_id})\n" + "\n".join(lines))
+            content = f"<@{EXCHANGE_NOTIFY_USER_ID}>" if EXCHANGE_NOTIFY_USER_ID else None
+            await admin_ch.send(content=content, embed=e)
+        except Exception as ex:
+            print(f"[티켓] 운영진 지급 알림 실패: {ex}")
+    return res
+
+
+@tasks.loop(minutes=1)
+async def ticket_draw_check():
+    """추첨 시각(매주 목요일 0시)이 지난 매물을 추첨합니다. 봇이 꺼져 있었다면 켜진 뒤 바로 추첨합니다."""
+    try:
+        rows = await adb("SELECT id, draw_at FROM ticket_items WHERE status='open'", (), "all")
+        now = datetime.now(KST)
+        for item_id, draw_at in rows:
+            if draw_at and datetime.fromisoformat(draw_at) <= now:
+                await draw_ticket_item(item_id)
+    except Exception as e:
+        print(f"[티켓] 추첨 점검 오류: {e!r}")
+
+
+@ticket_draw_check.before_loop
+async def _before_ticket_draw_check():
+    await bot.wait_until_ready()
+
+
+# ---------- 명령어 ----------
+@ticket_group.command(name="확인", description="내 티켓 수와 응모 현황을 확인합니다.")
+async def ticket_check(interaction: discord.Interaction):
+    if not await ensure_channel(interaction, MY_INFO_CHANNEL_ID, "티켓 확인"):
+        return
+    await interaction.response.defer(ephemeral=True)
+    row = await adb("SELECT COALESCE(tickets,0), COALESCE(minutes,0) FROM ticket_users WHERE user_id=%s",
+                    (interaction.user.id,), "one")
+    tickets, minutes = row if row else (0, 0)
+    entries = await adb(
+        """
+        SELECT i.id, i.name, COUNT(*) FROM ticket_entries e JOIN ticket_items i ON i.id = e.item_id
+        WHERE e.user_id=%s AND i.status='open' GROUP BY i.id, i.name ORDER BY i.id
+        """,
+        (interaction.user.id,), "all")
+    e = discord.Embed(title="🎟️ 내 티켓", color=0xE67E22)
+    e.add_field(name="보유 티켓", value=f"**{tickets}장**", inline=True)
+    e.add_field(name="다음 티켓까지", value=f"{TICKET_MINUTES_PER_TICKET - minutes}분 남음", inline=True)
+    e.add_field(name="이번 주 응모 현황",
+                value="\n".join(f"#{i} {n} · {c}회" for i, n, c in entries) or "아직 응모한 매물이 없어요.",
+                inline=False)
+    e.set_footer(text=f"길드 음성방에서 {TICKET_MINUTES_PER_TICKET}분 활동할 때마다 티켓 1장 · 추첨은 매주 목요일 0시")
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+
+@bot.tree.command(name="내정보", description="내 솔 에르다 조각, 티켓, 출석 정보를 한 번에 확인합니다.")
+async def my_info(interaction: discord.Interaction):
+    if not await ensure_channel(interaction, MY_INFO_CHANNEL_ID, "내 정보 확인"):
+        return
+    await interaction.response.defer(ephemeral=True)
+    uid = interaction.user.id
+    att = await adb("SELECT COALESCE(count,0), COALESCE(sol_erda_pieces,0), last_check FROM attendance_users WHERE user_id=%s",
+                    (uid,), "one")
+    tk = await adb("SELECT COALESCE(tickets,0), COALESCE(minutes,0) FROM ticket_users WHERE user_id=%s", (uid,), "one")
+    count, pieces, last_check = att if att else (0, 0, None)
+    tickets, minutes = tk if tk else (0, 0)
+    today_str = datetime.now(KST).strftime("%Y-%m-%d")
+    days_left = 7 - (count % 7)
+
+    e = discord.Embed(title=f"📋 {interaction.user.display_name} 님의 정보", color=0x5865F2)
+    e.add_field(name="💎 솔 에르다 조각", value=f"**{pieces}개** (최대 {MAX_SOL_ERDA_PIECES}개까지 적립)", inline=False)
+    e.add_field(name="🎟️ 티켓", value=f"**{tickets}장** · 다음 티켓까지 {TICKET_MINUTES_PER_TICKET - minutes}분", inline=False)
+    e.add_field(name="🗓️ 출석",
+                value=f"누적 **{count}일** · 오늘 {'✅ 완료' if last_check == today_str else '❌ 미완료'} · 다음 조각 보상까지 {days_left}일",
+                inline=False)
+    e.set_footer(text="조각 교환: /조각 교환 · 티켓 응모: 티켓교환소 채널")
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+
+@ticket_group.command(name="매물등록", description="[운영진] 티켓교환소에 응모 매물을 등록합니다.")
+@app_commands.rename(name="물품명", winners="당첨인원", cost="응모비용", description="설명")
+@app_commands.describe(name="응모 물품 이름", winners="당첨될 인원 수", cost="1회 응모에 필요한 티켓 수 (기본 1장)",
+                       description="추가 설명 (선택)")
+@app_commands.default_permissions(manage_roles=True)
+async def ticket_item_register(interaction: discord.Interaction, name: str,
+                               winners: app_commands.Range[int, 1, 50],
+                               cost: app_commands.Range[int, 1, 1000] = 1,
+                               description: str = None):
+    if not _is_verify_admin(interaction.user):
+        await interaction.response.send_message("❌ 운영진만 사용할 수 있어요.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    ch = get_ticket_shop_channel(interaction.guild)
+    if ch is None:
+        await interaction.followup.send(
+            f"❌ '{TICKET_SHOP_CHANNEL_NAME}' 채널을 찾을 수 없어요. 채널 이름을 확인하거나 코드의 TICKET_SHOP_CHANNEL_ID를 설정해주세요.",
+            ephemeral=True)
+        return
+    draw_at = next_thursday_midnight().isoformat()
+    row = await adb(
+        """
+        INSERT INTO ticket_items (name, description, winners, cost, status, channel_id, created_by, created_at, draw_at)
+        VALUES (%s, %s, %s, %s, 'open', %s, %s, %s, %s) RETURNING id
+        """,
+        (name, description, winners, cost, ch.id, interaction.user.id, datetime.now(KST).isoformat(), draw_at), "one")
+    item_id = row[0]
+    try:
+        msg = await ch.send(embed=build_ticket_item_embed(item_id, name, description, winners, cost, draw_at, 0, 0),
+                            view=build_ticket_item_view(item_id))
+    except Exception as e:
+        await adb("DELETE FROM ticket_items WHERE id=%s", (item_id,))
+        await interaction.followup.send(f"❌ 티켓교환소에 게시하지 못했어요: `{e}` (봇 권한을 확인해주세요)", ephemeral=True)
+        return
+    await adb("UPDATE ticket_items SET message_id=%s WHERE id=%s", (msg.id, item_id))
+    await interaction.followup.send(f"✅ 매물 #{item_id} **{name}** 을(를) {ch.mention}에 등록했어요.", ephemeral=True)
+
+
+def _cancel_ticket_item_sync(item_id):
+    """매물을 취소하고 응모에 쓴 티켓을 전부 돌려줍니다."""
+    conn = get_db_connection_plain()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT name, cost, status FROM ticket_items WHERE id=%s FOR UPDATE", (item_id,))
+        item = cur.fetchone()
+        if not item or item[2] != "open":
+            conn.rollback()
+            return None
+        name, cost, _ = item
+        cur.execute("SELECT user_id, COUNT(*) FROM ticket_entries WHERE item_id=%s GROUP BY user_id", (item_id,))
+        refunds = cur.fetchall()
+        for uid, cnt in refunds:
+            cur.execute("UPDATE ticket_users SET tickets = tickets + %s WHERE user_id=%s", (cnt * cost, uid))
+        cur.execute("UPDATE ticket_items SET status='cancelled' WHERE id=%s", (item_id,))
+        conn.commit()
+        cur.close()
+        return name, len(refunds)
+    finally:
+        conn.close()
+
+
+@ticket_group.command(name="매물삭제", description="[운영진] 응모 매물을 취소하고 사용된 티켓을 돌려줍니다.")
+@app_commands.rename(item_id="매물번호")
+@app_commands.describe(item_id="취소할 매물 번호 (게시글 하단의 #번호)")
+@app_commands.default_permissions(manage_roles=True)
+async def ticket_item_cancel(interaction: discord.Interaction, item_id: int):
+    if not _is_verify_admin(interaction.user):
+        await interaction.response.send_message("❌ 운영진만 사용할 수 있어요.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    row = await adb("SELECT channel_id, message_id FROM ticket_items WHERE id=%s", (item_id,), "one")
+    res = await asyncio.to_thread(_cancel_ticket_item_sync, item_id)
+    if res is None:
+        await interaction.followup.send("❌ 진행 중인 매물이 아니에요. (이미 추첨/취소됐거나 없는 번호)", ephemeral=True)
+        return
+    name, refunded = res
+    ch = bot.get_channel(row[0]) if row and row[0] else None
+    if ch and row[1]:
+        try:
+            msg = await ch.fetch_message(row[1])
+            e = discord.Embed(title=f"🚫 [취소됨] {name}", description="운영진에 의해 취소된 매물이에요. 응모에 쓴 티켓은 돌려드렸어요.",
+                              color=0x95A5A6)
+            await msg.edit(embed=e, view=build_ticket_item_view(item_id, disabled=True))
+        except Exception as ex:
+            print(f"[티켓] 매물 #{item_id} 취소 표시 실패: {ex}")
+    await interaction.followup.send(f"✅ 매물 #{item_id} **{name}** 을(를) 취소하고 {refunded}명에게 티켓을 돌려줬어요.", ephemeral=True)
+
+
+@ticket_group.command(name="즉시추첨", description="[운영진] 목요일을 기다리지 않고 지금 바로 추첨합니다.")
+@app_commands.rename(item_id="매물번호")
+@app_commands.describe(item_id="추첨할 매물 번호")
+@app_commands.default_permissions(manage_roles=True)
+async def ticket_item_draw_now(interaction: discord.Interaction, item_id: int):
+    if not _is_verify_admin(interaction.user):
+        await interaction.response.send_message("❌ 운영진만 사용할 수 있어요.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    res = await draw_ticket_item(item_id)
+    if res is None:
+        await interaction.followup.send("❌ 진행 중인 매물이 아니에요. (이미 추첨/취소됐거나 없는 번호)", ephemeral=True)
+        return
+    await interaction.followup.send(f"✅ 매물 #{item_id} 추첨 완료! 당첨 {len(res['winners'])}명", ephemeral=True)
+
+
+@ticket_group.command(name="수정", description="[운영진] 유저의 티켓 수를 직접 설정합니다.")
+@app_commands.rename(target="대상", amount="개수")
+@app_commands.describe(target="티켓을 수정할 유저", amount="설정할 티켓 수")
+@app_commands.default_permissions(manage_roles=True)
+async def ticket_set(interaction: discord.Interaction, target: discord.Member, amount: app_commands.Range[int, 0]):
+    if not _is_verify_admin(interaction.user):
+        await interaction.response.send_message("❌ 운영진만 사용할 수 있어요.", ephemeral=True)
+        return
+    await adb(
+        """
+        INSERT INTO ticket_users (user_id, tickets, minutes) VALUES (%s, %s, 0)
+        ON CONFLICT (user_id) DO UPDATE SET tickets = EXCLUDED.tickets
+        """,
+        (target.id, amount))
+    await interaction.response.send_message(f"✅ {target.mention} 님의 티켓을 **{amount}장**으로 설정했어요.", ephemeral=True)
+
+
+bot.tree.add_command(ticket_group)
 
 
 # 봇 실행부
