@@ -712,6 +712,8 @@ async def on_ready():
         check_voice_time.start()
     if not ticket_draw_check.is_running():
         ticket_draw_check.start()
+    if not youtube_upload_check.is_running():
+        youtube_upload_check.start()
     start_maple_background_tasks()
 
     # "나도 등록하기" 버튼이 재배포 후에도 계속 작동하도록 다시 등록합니다.
@@ -2257,6 +2259,8 @@ async def handle_verify_decision(interaction: discord.Interaction, request_id: i
             await announce_join_on_verify(char_name)
         except Exception as e:
             print(f"[인증] 가입 알림 처리 실패: {e}")
+        # 환영 채널에 환영 문구
+        await send_guild_welcome(member, char_name)
 
     # 승인 메시지 갱신 (버튼 비활성화)
     try:
@@ -3103,10 +3107,113 @@ async def get_verify_command_mention():
     return "`/인증`"
 
 
+WELCOME_CHANNEL_ID = 1498098502285393930   # 인증 완료 / 재입장 환영 문구를 보낼 채널
+
+
+async def send_guild_welcome(member, char_name, returning=False):
+    """인증이 완료된 길드원에게 환영 문구를 보냅니다."""
+    ch = bot.get_channel(WELCOME_CHANNEL_ID)
+    if ch is None:
+        print(f"[환영] 환영 채널({WELCOME_CHANNEL_ID})을 찾을 수 없습니다.")
+        return
+    if returning:
+        text = (f"🎉 {member.mention} 님, 다시 오신 걸 환영해요! (캐릭터: **{char_name}**)\n"
+                f"기존 인증 정보가 그대로 유지되어 바로 활동하실 수 있어요.")
+    else:
+        text = (f"🎉 {member.mention} 님, **{MAPLE_GUILD_NAME}** 길드에 오신 걸 환영해요! (캐릭터: **{char_name}**)\n"
+                f"앞으로 잘 부탁드려요! 😊")
+    try:
+        await ch.send(text, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+    except Exception as e:
+        print(f"[환영] 환영 문구 전송 실패: {e}")
+
+
+def _find_unverified_role(guild):
+    return discord.utils.get(guild.roles, name=UNVERIFIED_ROLE_KEYWORD) or next(
+        (r for r in guild.roles if UNVERIFIED_ROLE_KEYWORD in r.name), None)
+
+
+async def _is_still_in_guild(char_name, ocid):
+    """캐릭터가 아직 길드원인지 확인합니다. 돌려주는 값: (길드원 여부, 최신 닉네임)"""
+    if NEXON_API_KEY:
+        try:
+            basic = await nexon_get("/maplestory/v1/character/basic", {"ocid": ocid}, ttl=0)
+            return basic.get("character_guild_name") == MAPLE_GUILD_NAME, (basic.get("character_name") or char_name)
+        except Exception as e:
+            print(f"[재입장] 넥슨 API 조회 실패, 저장된 길드원 목록으로 확인합니다: {e}")
+    # API를 쓸 수 없으면 30분마다 저장하는 길드원 목록으로 확인
+    row = await adb("SELECT value FROM maple_state WHERE key=%s", ("guild_members",), "one")
+    try:
+        names = json.loads(row[0]) if row else []
+    except Exception:
+        names = []
+    return char_name.lower() in {n.lower() for n in names}, char_name
+
+
+async def try_restore_verification(member):
+    """예전에 인증한 유저가 다시 들어왔고 아직 길드원이면 인증 상태를 복구합니다.
+    복구했으면 캐릭터 닉네임을, 아니면 None을 돌려줍니다."""
+    row = await adb("SELECT character_name, ocid FROM maple_verifications WHERE user_id=%s", (member.id,), "one")
+    if not row:
+        return None
+    char_name, ocid = row
+    in_guild, latest = await _is_still_in_guild(char_name, ocid)
+    if not in_guild:
+        print(f"[재입장] {member} ({char_name}) 은(는) 길드원이 아니어서 다시 인증이 필요합니다.")
+        return None
+    if latest != char_name:
+        await adb("UPDATE maple_verifications SET character_name=%s WHERE user_id=%s", (latest, member.id))
+        char_name = latest
+
+    role = discord.utils.get(member.guild.roles, name=VERIFIED_ROLE_NAME)
+    if role is None:
+        print(f"[재입장] `{VERIFIED_ROLE_NAME}` 역할을 찾을 수 없어 복구하지 못했습니다.")
+        return None
+    try:
+        await member.add_roles(role, reason=f"재입장 - 기존 인증 유지 ({char_name})")
+    except Exception as e:
+        print(f"[재입장] {VERIFIED_ROLE_NAME} 역할 부여 실패: {e}")
+        return None
+    try:
+        stale = [r for r in member.roles if UNVERIFIED_ROLE_KEYWORD in r.name and r != role]
+        if stale:
+            await member.remove_roles(*stale, reason="재입장 - 기존 인증 유지")
+    except Exception as e:
+        print(f"[재입장] 미인증 역할 회수 실패: {e}")
+    try:
+        await member.edit(nick=char_name[:32], reason=f"재입장 - 기존 인증 유지 ({char_name})")
+    except Exception as e:
+        print(f"[재입장] 닉네임 변경 실패: {e}")
+    return char_name
+
+
 @bot.event
 async def on_member_join(member: discord.Member):
     if member.bot or member.guild.id != GUILD_ID_FOR_COMMANDS:
         return
+
+    # 1) 예전에 인증했고 아직 길드원이면: 인증 상태 그대로 복구 + 환영 문구 (다시 인증할 필요 없음)
+    try:
+        restored = await try_restore_verification(member)
+    except Exception as e:
+        print(f"[재입장] 인증 복구 확인 중 오류: {e!r}")
+        restored = None
+    if restored:
+        await send_guild_welcome(member, restored, returning=True)
+        return
+
+    # 2) 신규(또는 길드를 떠난) 유저: 미인증 역할 부여 + 인증 안내
+    unverified_role = _find_unverified_role(member.guild)
+    if unverified_role is None:
+        print(f"[입장] '{UNVERIFIED_ROLE_KEYWORD}' 역할을 찾을 수 없어 자동 부여를 건너뜁니다.")
+    elif unverified_role not in member.roles:
+        try:
+            await member.add_roles(unverified_role, reason="신규 입장 - 미인증 역할 자동 부여")
+        except discord.Forbidden:
+            print(f"[입장] 미인증 역할 부여 권한 없음 (봇 역할이 '{unverified_role.name}'보다 위에 있어야 해요)")
+        except Exception as e:
+            print(f"[입장] 미인증 역할 부여 실패: {e}")
+
     ch = member.guild.get_channel(VERIFY_REQUEST_CHANNEL_ID)
     if ch is None:
         return
@@ -3841,6 +3948,86 @@ async def ticket_set(interaction: discord.Interaction, target: discord.Member, a
 
 
 bot.tree.add_command(ticket_group)
+
+
+# ------------------------------------------
+# 유튜브 새 영상 알림 (유튜브 공식 RSS 피드 사용 · API 키 불필요)
+# ------------------------------------------
+import xml.etree.ElementTree as ET
+
+# 알림 받을 유튜브 채널: (유튜브 채널 ID, 표시 이름)
+YOUTUBE_CHANNELS = [
+    ("UC1dHu9GhbHH7RcHKyJdaOvA", "메이플스토리맑음"),
+]
+YOUTUBE_NOTIFY_CHANNEL_ID = MAPLE_NOTICE_CHANNEL_ID  # 알림을 올릴 디스코드 채널 (바꾸려면 여기 ID만 수정)
+YOUTUBE_INCLUDE_SHORTS = True   # 쇼츠도 알릴지 여부
+YOUTUBE_CHECK_MINUTES = 10      # 확인 간격(분)
+
+_YT_NS = {"atom": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
+
+
+async def fetch_youtube_feed(channel_id):
+    """채널의 최근 영상 목록을 [(video_id, 제목, 링크), ...] (최신순)으로 돌려줍니다."""
+    url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"HTTP {resp.status}")
+            text = await resp.text()
+    root = ET.fromstring(text)
+    videos = []
+    for entry in root.findall("atom:entry", _YT_NS):
+        vid = entry.findtext("yt:videoId", default="", namespaces=_YT_NS)
+        title = entry.findtext("atom:title", default="", namespaces=_YT_NS)
+        link_el = entry.find("atom:link", _YT_NS)
+        link = link_el.get("href") if link_el is not None else f"https://www.youtube.com/watch?v={vid}"
+        if vid:
+            videos.append((vid, title, link))
+    return videos
+
+
+@tasks.loop(minutes=YOUTUBE_CHECK_MINUTES)
+async def youtube_upload_check():
+    ch = bot.get_channel(YOUTUBE_NOTIFY_CHANNEL_ID)
+    if ch is None:
+        print(f"[유튜브 알림] 알림 채널({YOUTUBE_NOTIFY_CHANNEL_ID})을 찾을 수 없습니다.")
+        return
+    for yt_channel_id, display_name in YOUTUBE_CHANNELS:
+        try:
+            videos = await fetch_youtube_feed(yt_channel_id)
+            if not videos:
+                continue
+            key = f"youtube_seen:{yt_channel_id}"
+            row = await adb("SELECT value FROM maple_state WHERE key=%s", (key,), "one")
+            ids = [v[0] for v in videos]
+            if row is None:
+                # 첫 실행: 지금 있는 영상은 알리지 않고 기록만 해둡니다.
+                new_videos = []
+                seen = ids
+            else:
+                seen = json.loads(row[0])
+                seen_set = set(seen)
+                new_videos = [v for v in videos if v[0] not in seen_set]
+                seen = list(dict.fromkeys(seen + ids))[-200:]
+
+            for vid, title, link in reversed(new_videos):  # 오래된 것부터 올림
+                if not YOUTUBE_INCLUDE_SHORTS and "/shorts/" in link:
+                    continue
+                await ch.send(f"📺 **{display_name}** 님의 새 영상이 올라왔어요!\n**{title}**\n{link}")
+
+            await adb(
+                """
+                INSERT INTO maple_state (key, value) VALUES (%s, %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """,
+                (key, json.dumps(seen, ensure_ascii=False)))
+        except Exception as e:
+            print(f"[유튜브 알림] {display_name} 확인 실패: {e!r}")
+
+
+@youtube_upload_check.before_loop
+async def _before_youtube_upload_check():
+    await bot.wait_until_ready()
 
 
 # 봇 실행부
